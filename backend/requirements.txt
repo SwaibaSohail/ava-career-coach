@@ -1,0 +1,20 @@
+# API
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+
+# Document generation (CV / cover letter -> .docx / .pdf)
+python-docx
+fpdf2
+
+# RAG / agent stack
+langchain
+langchain-community
+langchain-groq
+langchain-chroma
+langgraph
+chromadb
+pypdf
+fastembed
+langchain-tavily
