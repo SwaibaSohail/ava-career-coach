@@ -83,8 +83,3 @@ backend/    FastAPI app, the Ava agent, RAG pipeline, and document generation
 frontend/   React (Vite) single-chat UI
 uploads/    sample CVs (gitignored)
 ```
-
-## Notes
-
-- Free-tier Groq / Tavily limits apply; Ava surfaces rate limits gracefully.
-- API keys live in `backend/.env` and are gitignored — never commit them.
