@@ -17,7 +17,16 @@ export default function Message({ message, streaming }) {
   return (
     <div className="msg assistant">
       {content ? (
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{clean(content)}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            a: ({ node, ...props }) => (
+              <a {...props} target="_blank" rel="noopener noreferrer" />
+            ),
+          }}
+        >
+          {clean(content)}
+        </ReactMarkdown>
       ) : streaming ? (
         <span className="typing">Ava is typing…</span>
       ) : null}
