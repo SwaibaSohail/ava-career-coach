@@ -84,6 +84,29 @@ def check_injection(message: str) -> bool:
     return bool(INJECTION_RE.search(message or ""))
 
 
+# --- Stage 4: rule-based abuse / spam gate -----------------------------------
+
+# Starter profanity/slur set; extend with a maintained list over time.
+_PROFANITY = {"fuck", "fucking", "shit", "bitch", "asshole", "bastard", "cunt"}
+
+
+def check_input(message: str) -> str | None:
+    """Return 'abuse' or 'spam' if the message trips a rule, else None."""
+    text = (message or "").strip()
+    low = text.lower()
+    words = re.findall(r"[a-zA-Z']+", low)
+
+    if any(w in _PROFANITY for w in words):
+        return "abuse"
+    if len(re.findall(r"https?://", low)) >= 3:
+        return "spam"
+    if re.search(r"(.)\1{9,}", text):          # same char run >= 10
+        return "spam"
+    if words and max(words.count(w) for w in set(words)) >= 8:  # one word spammed
+        return "spam"
+    return None
+
+
 # --- Guarded replies (canned; NEVER calls an LLM) ----------------------------
 
 _REPLIES = {
@@ -124,6 +147,12 @@ def guard_incoming(message: str) -> GuardResult:
     if check_injection(cleaned):
         return GuardResult(
             False, cleaned, "injection", generate_guarded_reply("injection", dialect), dialect
+        )
+
+    category = check_input(cleaned)
+    if category:
+        return GuardResult(
+            False, cleaned, category, generate_guarded_reply(category, dialect), dialect
         )
 
     return GuardResult(True, cleaned, None, None, dialect)
