@@ -3,7 +3,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from guardrails import GuardResult, truncate, generate_guarded_reply, guard_incoming
+from guardrails import (
+    GuardResult,
+    truncate,
+    generate_guarded_reply,
+    guard_incoming,
+    detect_dialect,
+)
 
 
 def test_truncate_caps_length():
@@ -31,3 +37,21 @@ def test_guard_incoming_allows_a_clean_message():
     assert result.category is None
     assert result.safe_reply is None
     assert result.cleaned_message == "Please tailor my CV for a frontend role"
+
+
+def test_detect_dialect_english():
+    assert detect_dialect("Please tailor my CV for a frontend role") == "english"
+
+
+def test_detect_dialect_roman_urdu():
+    assert detect_dialect("mera cv theek karo bhai") == "roman_urdu"
+
+
+def test_detect_dialect_mixed():
+    assert detect_dialect("mera CV theek kar do for a marketing job") == "mixed"
+
+
+def test_detect_dialect_never_blocks_via_guard_incoming():
+    result = guard_incoming("mera cv theek karo bhai")
+    assert result.allowed is True
+    assert result.dialect == "roman_urdu"
