@@ -5,11 +5,12 @@ CV (or interviews the user if there's none), and produces downloadable documents
 via the save_document tool. Memory is per-session via the thread_id.
 """
 
+import asyncio
 import json
 import re
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -188,16 +189,7 @@ def _session_tools(session):
             content: the complete document in Markdown.
         """
         normalized = "cover_letter" if "cover" in kind.lower() else "cv"
-        content = _clean_doc(content)
-        doc_id, docx_path, pdf_path = build_document(normalized, title, content)
-        session.documents[doc_id] = Document(
-            id=doc_id,
-            kind=normalized,
-            title=title or normalized,
-            content=content,
-            docx_path=docx_path,
-            pdf_path=pdf_path,
-        )
+        doc_id = _store_document(session, normalized, title or normalized, content)
         return f"Document saved and ready to download (id: {doc_id})."
 
     @tool
@@ -224,13 +216,6 @@ def _build_ava(session):
     )
 
 
-def _final_text(result: dict) -> str:
-    for msg in reversed(result.get("messages") or []):
-        if isinstance(msg, AIMessage) and msg.content:
-            return msg.content
-    return "Sorry, I didn't catch that — could you say it again?"
-
-
 def _error_reply(exc: Exception) -> str:
     message = str(exc)
     if any(k in message for k in ("rate_limit", "429", "413")):
@@ -254,10 +239,6 @@ def _extract_doc_payload(text: str) -> dict | None:
         if isinstance(obj, dict) and obj.get("content") and (obj.get("kind") or obj.get("title")):
             return obj
     return None
-
-
-def _strip_json_blocks(text: str) -> str:
-    return _JSON_BLOCK.sub("", text or "").strip()
 
 
 # The gap note belongs in chat, not the document; strip it if it slips into content.
@@ -287,34 +268,34 @@ def _clean_doc(content: str) -> str:
     return "\n".join(out).strip()
 
 
-def _save_payload(session, payload: dict) -> None:
-    kind = "cover_letter" if "cover" in str(payload.get("kind", "")).lower() else "cv"
-    title = str(payload.get("title") or kind)
-    content = _clean_doc(str(payload.get("content") or ""))
+def _store_document(session, kind: str, title: str, content: str) -> str:
+    """Clean, render to DOCX/PDF, and store a document; return its id."""
+    content = _clean_doc(content)
     doc_id, docx_path, pdf_path = build_document(kind, title, content)
     session.documents[doc_id] = Document(
         id=doc_id, kind=kind, title=title, content=content, docx_path=docx_path, pdf_path=pdf_path
     )
+    return doc_id
+
+
+def _save_payload(session, payload: dict) -> None:
+    kind = "cover_letter" if "cover" in str(payload.get("kind", "")).lower() else "cv"
+    title = str(payload.get("title") or kind)
+    _store_document(session, kind, title, str(payload.get("content") or ""))
 
 
 def chat_with_ava(session, user_message: str):
-    """Run one turn synchronously. Returns (reply_text, [new Document objects])."""
+    """Run one turn synchronously by driving stream_ava. Returns (reply, [new docs])."""
     before = set(session.documents)
-    agent = _build_ava(session)
-    try:
-        result = agent.invoke(
-            {"messages": [HumanMessage(content=user_message)]},
-            config={"configurable": {"thread_id": session.thread_id}, "recursion_limit": 16},
-        )
-        reply = _final_text(result)
-    except Exception as exc:
-        reply = _error_reply(exc)
-    # Fallback: model printed the payload instead of calling the tool.
-    if not any(i not in before for i in session.documents):
-        payload = _extract_doc_payload(reply)
-        if payload:
-            _save_payload(session, payload)
-            reply = _strip_json_blocks(reply)
+
+    async def _run():
+        parts = []
+        async for kind, data in stream_ava(session, user_message):
+            if kind == "token":
+                parts.append(data)
+        return "".join(parts)
+
+    reply = asyncio.run(_run())
     new_docs = [session.documents[i] for i in session.documents if i not in before]
     return reply, new_docs
 

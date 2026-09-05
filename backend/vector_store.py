@@ -18,13 +18,11 @@ def get_embeddings() -> FastEmbedEmbeddings:
 
 def build_cv_vector_store(chunks: list) -> Chroma:
     """Store the CV chunks in a fresh in-memory collection (one per upload)."""
-    embeddings = get_embeddings()
-    vector_store = Chroma.from_documents(
+    return Chroma.from_documents(
         documents=chunks,
-        embedding=embeddings,
+        embedding=get_embeddings(),
         collection_name="cv_collection",
     )
-    return vector_store
 
 
 def get_relevant_cv_text(vector_store: Chroma, query: str, k: int = 8) -> str:

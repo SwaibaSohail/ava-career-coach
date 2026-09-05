@@ -23,7 +23,6 @@ class Session:
     vector_store: object = None
     cv_text: str = ""
     has_cv: bool = False
-    target_job: str = ""
     thread_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     documents: dict = field(default_factory=dict)  # id -> Document
 

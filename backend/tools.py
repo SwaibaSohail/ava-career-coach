@@ -1,36 +1,9 @@
-"""Agent tools: calculator (local math), web_search and job_search (both via Tavily)."""
-
-import ast
-import operator
+"""Agent tools: web_search and job_search (both via Tavily)."""
 
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 
 import config
-
-# Only the math operations we allow. This is safer than Python's eval().
-_OPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-    ast.Mod: operator.mod,
-    ast.USub: operator.neg,
-}
-
-
-def _eval_math(node):
-    """Walk an AST and evaluate only simple arithmetic."""
-    if isinstance(node, ast.Expression):
-        return _eval_math(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
-        return _OPS[type(node.op)](_eval_math(node.left), _eval_math(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
-        return _OPS[type(node.op)](_eval_math(node.operand))
-    raise ValueError("Only basic arithmetic is allowed (+ - * / ** %).")
 
 
 def _tavily(max_results: int = 3) -> TavilySearch:
@@ -68,19 +41,15 @@ def _format_results(raw) -> str:
     return "\n\n".join(lines)
 
 
-@tool
-def calculator(expression: str) -> str:
-    """Evaluate a basic math expression. Use this for scores, averages, or comparisons.
-
-    Args:
-        expression: A math expression such as "85 - 12" or "(3 + 4) / 2".
-    """
+def _tavily_search(query: str, max_results: int, label: str, **extra) -> str:
+    """Run a Tavily query and format it, or return a friendly error string."""
+    if not config.is_tavily_configured():
+        return "Tavily is not configured. Add TAVILY_API_KEY to your .env file."
     try:
-        tree = ast.parse(expression, mode="eval")
-        value = _eval_math(tree)
-        return str(value)
+        raw = _tavily(max_results=max_results).invoke({"query": query, **extra})
+        return _format_results(raw)
     except Exception as exc:
-        return f"Could not calculate that: {exc}"
+        return f"{label} failed: {exc}"
 
 
 @tool
@@ -90,13 +59,7 @@ def web_search(query: str) -> str:
     Args:
         query: What to search for.
     """
-    if not config.is_tavily_configured():
-        return "Tavily is not configured. Add TAVILY_API_KEY to your .env file."
-    try:
-        raw = _tavily(max_results=3).invoke({"query": query})
-        return _format_results(raw)
-    except Exception as exc:
-        return f"Web search failed: {exc}"
+    return _tavily_search(query, 3, "Web search")
 
 
 @tool
@@ -108,20 +71,10 @@ def job_search(role: str, skills: str, location: str = "remote") -> str:
         skills: Comma-separated skills from the CV, e.g. "Python, FastAPI, SQL".
         location: City, country, or "remote".
     """
-    if not config.is_tavily_configured():
-        return "Tavily is not configured. Add TAVILY_API_KEY to your .env file."
-
     query = f"{role} jobs {location} hiring {skills}"
-    try:
-        raw = _tavily(max_results=5).invoke({
-            "query": query,
-            "time_range": "month",
-        })
-        return _format_results(raw)
-    except Exception as exc:
-        return f"Job search failed: {exc}"
+    return _tavily_search(query, 5, "Job search", time_range="month")
 
 
 def get_tools() -> list:
     """Return the list of tools we hand to the agent."""
-    return [calculator, web_search, job_search]
+    return [web_search, job_search]

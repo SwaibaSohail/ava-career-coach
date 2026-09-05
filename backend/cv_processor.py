@@ -15,6 +15,11 @@ from guardrails import INJECTION_RE as _INJECTION_RE
 _REDACTION = "[redacted: suspected injected instruction in uploaded file]"
 
 
+def _load_pages(pdf_path: str):
+    """Load a PDF's pages (shared by chunking and full-text extraction)."""
+    return PyPDFLoader(pdf_path).load()
+
+
 def sanitize_cv_text(text: str) -> str:
     """Neutralize prompt-injection attempts hidden in an uploaded CV.
 
@@ -33,8 +38,7 @@ def sanitize_cv_text(text: str) -> str:
 
 def load_and_chunk_cv(pdf_path: str) -> list:
     """Split a CV PDF into overlapping, section-aware chunks."""
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()
+    pages = _load_pages(pdf_path)
     for page in pages:
         page.page_content = sanitize_cv_text(page.page_content)
 
@@ -70,6 +74,5 @@ def load_and_chunk_cv(pdf_path: str) -> list:
 
 def extract_full_text(pdf_path: str) -> str:
     """Return the whole CV as one string (used for the match analysis)."""
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()
+    pages = _load_pages(pdf_path)
     return sanitize_cv_text("\n".join(page.page_content for page in pages))
