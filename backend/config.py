@@ -10,6 +10,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
+# Guardrails: a small, cheap model for the ingress LLM safety check (stage 5),
+# kept separate from the main GROQ_MODEL. Fail-open if it errors.
+GUARD_MODEL = os.getenv("GUARD_MODEL", "llama-3.1-8b-instant")
+GUARD_LLM_ENABLED = os.getenv("GUARD_LLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
 # Local embedding model — runs on-device, no API key or cost.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
