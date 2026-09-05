@@ -5,33 +5,12 @@ it is a prompt-injection vector, so we scrub instruction-like lines (e.g. "ignor
 previous instructions", "system override") before the text is used anywhere.
 """
 
-import re
-
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
-
-
-# Phrases that only make sense as commands aimed at an AI, not as CV content.
-_INJECTION_PATTERNS = [
-    r"ignore\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|faithfulness|honesty|guidelines?|polic\w+)",
-    r"disregard\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|above|previous|prior)",
-    r"forget\b[\w\s,'-]{0,40}\b(?:instructions?|rules?)",
-    r"system\s*(?:instruction|override|prompt)s?\b",
-    r"developer\s*(?:mode|override)\b",
-    r"(?:instruction|message|note|command)s?\s+(?:to|for)\s+(?:the\s+)?(?:ai|assistant|model|llm|chatbot|system|language model)\b",
-    r"\byou\s+(?:are|must|should|shall|will)\s+now\b",
-    r"\byou\s+(?:must|should|shall|are required to|have to)\s+(?:add|include|claim|state|say|write|list|ignore|not\b|never\b)",
-    r"(?:do not|don't|must not|shall not|never)\s+(?:mention|tell|reveal|show|disclose|inform)\b",
-    r"(?:do not|don't|must not|never)\s+(?:question|verify|check|fact[\s-]?check|challenge)\b",
-    r"\bwithout\s+(?:questioning|verifying|checking)\b",
-    r"\bas an ai\b",
-    r"\bnew\s+instructions?\s*[:.]",
-    r"\bpretend\s+(?:to be|you(?:'re| are))\b",
-    r"\b(?:jailbreak|no\s+restrictions|without\s+restrictions|unrestricted mode)\b",
-]
-_INJECTION_RE = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
+# One source of truth for the injection patterns, shared with the chat guardrails.
+from guardrails import INJECTION_RE as _INJECTION_RE
 
 _REDACTION = "[redacted: suspected injected instruction in uploaded file]"
 

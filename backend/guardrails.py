@@ -55,6 +55,35 @@ def detect_dialect(message: str) -> str:
     return "mixed"
 
 
+# --- Stage 3: regex injection gate -------------------------------------------
+
+# Phrases that only make sense as commands aimed at an AI, not as chat/CV text.
+# Single source of truth: cv_processor.sanitize_cv_text imports INJECTION_RE.
+INJECTION_PATTERNS = [
+    r"ignore\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|faithfulness|honesty|guidelines?|polic\w+)",
+    r"disregard\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|above|previous|prior)",
+    r"forget\b[\w\s,'-]{0,40}\b(?:instructions?|rules?)",
+    r"system\s*(?:instruction|override|prompt)s?\b",
+    r"developer\s*(?:mode|override)\b",
+    r"(?:instruction|message|note|command)s?\s+(?:to|for)\s+(?:the\s+)?(?:ai|assistant|model|llm|chatbot|system|language model)\b",
+    r"\byou\s+(?:are|must|should|shall|will)\s+now\b",
+    r"\byou\s+(?:must|should|shall|are required to|have to)\s+(?:add|include|claim|state|say|write|list|ignore|not\b|never\b)",
+    r"(?:do not|don't|must not|shall not|never)\s+(?:mention|tell|reveal|show|disclose|inform)\b",
+    r"(?:do not|don't|must not|never)\s+(?:question|verify|check|fact[\s-]?check|challenge)\b",
+    r"\bwithout\s+(?:questioning|verifying|checking)\b",
+    r"\bas an ai\b",
+    r"\bnew\s+instructions?\s*[:.]",
+    r"\bpretend\s+(?:to be|you(?:'re| are))\b",
+    r"\b(?:jailbreak|no\s+restrictions|without\s+restrictions|unrestricted mode)\b",
+]
+INJECTION_RE = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
+
+
+def check_injection(message: str) -> bool:
+    """True if the message looks like a prompt-injection command."""
+    return bool(INJECTION_RE.search(message or ""))
+
+
 # --- Guarded replies (canned; NEVER calls an LLM) ----------------------------
 
 _REPLIES = {
@@ -91,4 +120,10 @@ def generate_guarded_reply(category: str | None, dialect: str = "english") -> st
 def guard_incoming(message: str) -> GuardResult:
     cleaned = truncate(message)
     dialect = detect_dialect(cleaned)
+
+    if check_injection(cleaned):
+        return GuardResult(
+            False, cleaned, "injection", generate_guarded_reply("injection", dialect), dialect
+        )
+
     return GuardResult(True, cleaned, None, None, dialect)
