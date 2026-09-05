@@ -18,6 +18,7 @@ import config
 from cv_processor import load_and_chunk_cv, extract_full_text
 from vector_store import build_cv_vector_store
 from agent import stream_ava, AVA_GREETING
+from guardrails import guard_incoming
 from schemas import MessageRequest, SessionResponse, UploadResponse
 from session_store import create_session, find_document, get_session
 
@@ -75,26 +76,34 @@ async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
     return UploadResponse(ok=True, filename=file.filename or "cv.pdf", chars=len(session.cv_text))
 
 
+async def _message_events(session, user_message: str):
+    """Yield SSE frames for one turn. Runs the ingress guardrails first; a
+    blocked message streams a canned reply and never reaches the agent."""
+    guard = guard_incoming(user_message)
+    if not guard.allowed:
+        yield f"data: {json.dumps({'type': 'token', 'text': guard.safe_reply})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return
+    async for kind, data in stream_ava(session, guard.cleaned_message):
+        payload = {"type": kind}
+        if kind == "token":
+            payload["text"] = data
+        elif kind == "document":
+            payload.update(data)
+        yield f"data: {json.dumps(payload)}\n\n"
+
+
 @app.post("/api/message")
 async def message(req: MessageRequest):
     """One conversation turn with Ava, streamed as Server-Sent Events.
 
     Each line is `data: {json}` where json.type is 'token' (a text delta),
-    'document' (a saved file: id/kind/title), or 'done'.
+    'document' (a saved file: id/kind/title), or 'done'. Incoming messages pass
+    the Layer-1 ingress guardrails before reaching the agent.
     """
     session = _require(req.session_id)
-
-    async def events():
-        async for kind, data in stream_ava(session, req.message):
-            payload = {"type": kind}
-            if kind == "token":
-                payload["text"] = data
-            elif kind == "document":
-                payload.update(data)
-            yield f"data: {json.dumps(payload)}\n\n"
-
     return StreamingResponse(
-        events(),
+        _message_events(session, req.message),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
