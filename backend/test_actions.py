@@ -5,8 +5,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pytest
 
+import actions
 import config
 import session_store
+from session_store import Session
 
 
 @pytest.fixture(autouse=True)
@@ -56,3 +58,82 @@ def test_build_email_action_rejects_bad_input(to, subject, body):
     with pytest.raises(ValueError):
         actions.build_email_action(s, to, subject, body)
     assert s.pending_actions == {}
+
+
+def _pending(s):
+    return actions.build_email_action(s, "jobs@acme.com", "Application", "Hello there.")
+
+
+def test_execute_email_sends_once(monkeypatch):
+    sent = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=None):
+            sent["host"] = host
+            sent["port"] = port
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def starttls(self):
+            sent["tls"] = True
+        def login(self, u, p):
+            sent["login"] = u
+        def send_message(self, msg):
+            sent["msg"] = msg
+
+    monkeypatch.setattr(actions.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(config, "SMTP_HOST", "smtp.x")
+    monkeypatch.setattr(config, "SMTP_PORT", 587)
+    monkeypatch.setattr(config, "SMTP_USER", "me@x.com")
+    monkeypatch.setattr(config, "SMTP_PASSWORD", "pw")
+    monkeypatch.setattr(config, "SMTP_FROM", "me@x.com")
+
+    s = Session()
+    a = _pending(s)
+    actions.execute_email(a)
+    assert a.status == "sent"
+    assert sent["msg"]["To"] == "jobs@acme.com"
+    assert sent["msg"]["From"] == "me@x.com"
+    assert sent["msg"]["Subject"] == "Application"
+    assert sent["tls"] is True and sent["login"] == "me@x.com"
+
+
+def test_execute_email_no_resend_when_sent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(actions, "send_email_smtp", lambda *a, **k: calls.append(1))
+    s = Session()
+    a = _pending(s)
+    a.status = "sent"
+    actions.execute_email(a)
+    assert calls == []
+
+
+def test_execute_email_retries_when_failed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(actions, "send_email_smtp", lambda *a, **k: calls.append(1))
+    s = Session()
+    a = _pending(s)
+    a.status = "failed"
+    actions.execute_email(a)
+    assert calls == [1] and a.status == "sent"
+
+
+def test_execute_email_no_send_when_sending(monkeypatch):
+    calls = []
+    monkeypatch.setattr(actions, "send_email_smtp", lambda *a, **k: calls.append(1))
+    s = Session()
+    a = _pending(s)
+    a.status = "sending"
+    actions.execute_email(a)
+    assert calls == []
+
+
+def test_execute_email_failure_sets_failed(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("smtp down")
+    monkeypatch.setattr(actions, "send_email_smtp", boom)
+    s = Session()
+    a = _pending(s)
+    actions.execute_email(a)
+    assert a.status == "failed" and "smtp down" in (a.error or "")
