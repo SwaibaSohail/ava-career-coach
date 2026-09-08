@@ -9,7 +9,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
-# One source of truth for the injection patterns, shared with the chat guardrails.
+# The broad CV-file injection patterns (chat uses the stricter CHAT_INJECTION_RE).
 from guardrails import INJECTION_RE as _INJECTION_RE
 
 _REDACTION = "[redacted: suspected injected instruction in uploaded file]"

@@ -23,8 +23,10 @@ class GuardResult:
 
 # --- Stage 1: length + control-char truncate ---------------------------------
 
-def truncate(message: str, max_chars: int = config.MAX_MESSAGE_CHARS) -> str:
+def truncate(message: str, max_chars: int | None = None) -> str:
     """Cap length and strip control characters (keep newlines and tabs)."""
+    if max_chars is None:
+        max_chars = config.MAX_MESSAGE_CHARS  # resolved per call, not at import
     text = message or ""
     text = "".join(
         ch for ch in text
@@ -91,7 +93,9 @@ CHAT_INJECTION_PATTERNS = [
     r"system\s*(?:instruction|override|prompt)s?\b",
     r"developer\s*(?:mode|override)\b",
     r"(?:instruction|message|note|command)s?\s+(?:to|for)\s+(?:the\s+)?(?:ai|assistant|model|llm|chatbot|system|language model)\b",
-    r"\byou\s+(?:are|must|should|shall|will)\s+now\b",
+    # Only the identity-reprogram form ("you are now a/DAN/…"), not benign
+    # "you should/will now have/see …" that a real user might type.
+    r"\byou\s+are\s+now\s+(?:an?|dan|in|acting|playing|jailbroken|unrestricted)\b",
     r"\bas an ai\b[\s,]*(?:assistant|model|language model|you\b)",
     r"\bnew\s+instructions?\s*[:.]",
     r"\bpretend\s+(?:to be|you(?:'re| are))\b",

@@ -72,11 +72,21 @@ def _ensure_pdf(content: bytes) -> None:
 
 def _process_cv(session, pdf_path: str) -> None:
     """Blocking CV parse + embed. Run off the event loop via run_in_threadpool."""
-    session.vector_store = build_cv_vector_store(load_and_chunk_cv(pdf_path))
-    session.cv_text = extract_full_text(pdf_path)
+    # Build the new store first so a parse failure leaves the old CV intact.
+    new_store = build_cv_vector_store(load_and_chunk_cv(pdf_path))
+    cv_text = extract_full_text(pdf_path)
+    old_store = session.vector_store
+    session.vector_store = new_store
+    session.cv_text = cv_text
     session.has_cv = True
     # Fresh memory so earlier draft/example CVs can't leak into tailoring.
     session.thread_id = str(uuid.uuid4())
+    # Drop the previous upload's collection so it doesn't linger in memory.
+    if old_store is not None:
+        try:
+            old_store.delete_collection()
+        except Exception:
+            pass
 
 
 @app.post("/api/upload", response_model=UploadResponse)

@@ -82,6 +82,8 @@ def test_check_injection_allows_legit_chat_instructions():
         "don't show my home address on the CV",
         "you should not include my phone number",
         "worked as an AI engineer at Acme",
+        "you should now have my updated CV",
+        "you will now see two versions of the summary",
     ]:
         assert not check_injection(msg), msg
 
