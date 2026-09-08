@@ -27,7 +27,7 @@ grounded in the CV → `save_document` renders a DOCX and PDF you can download.
 React chat  ──HTTP / SSE──▶  FastAPI
                               ├─ session / upload   (RAG: ChromaDB + FastEmbed)
                               ├─ message  ─▶ Ava agent (LangGraph + Groq)
-                              │               tools: job_search, search_cv, save_document
+                              │               tools: job_search, web_search, search_cv, save_document
                               └─ document ─▶ DOCX / PDF
 ```
 
@@ -99,5 +99,11 @@ On Windows PowerShell, set the flag first: `$env:RUN_LLM_TESTS=1; pytest test_in
 ```
 backend/    FastAPI app, the Ava agent, RAG pipeline, and document generation
 frontend/   React (Vite) single-chat UI
-uploads/    sample CVs (gitignored)
+uploads/    sample CVs for local testing (gitignored; runtime uploads are parsed in memory, not stored)
 ```
+
+## Notes
+
+Chat sessions live in memory and generated files under `backend/generated/` aren't
+auto-pruned, so restarting the server clears chat state. Fine for local use; add
+persistence and cleanup before deploying.

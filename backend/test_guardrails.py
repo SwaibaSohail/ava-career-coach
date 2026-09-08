@@ -3,6 +3,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import asyncio
+
+import pytest
+
+import config as app_config
+import guardrails
 from guardrails import (
     GuardResult,
     truncate,
@@ -11,6 +17,7 @@ from guardrails import (
     detect_dialect,
     check_injection,
     check_input,
+    check_input_llm,
 )
 
 
@@ -139,13 +146,6 @@ def test_guard_incoming_blocks_abuse():
     assert result.safe_reply == generate_guarded_reply("abuse")
 
 
-import pytest
-
-import guardrails
-import config as app_config
-from guardrails import check_input_llm
-
-
 @pytest.fixture(autouse=True)
 def _disable_llm_guard_by_default(monkeypatch):
     # Keep the whole suite hermetic: no live Groq calls unless a test opts in
@@ -194,9 +194,6 @@ def test_llm_guard_not_called_when_abuse_blocks(monkeypatch):
     assert result.allowed is False
     assert result.category == "abuse"
     assert calls == []
-
-
-import asyncio
 
 
 def _collect(async_gen):

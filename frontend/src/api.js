@@ -1,5 +1,6 @@
 // All backend calls for the Ava chat live here.
-const BASE = "http://localhost:8000/api";
+// Override with VITE_API_BASE at build/dev time; defaults to the local backend.
+const BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 
 export async function startSession() {
   const res = await fetch(BASE + "/session", { method: "POST" });
