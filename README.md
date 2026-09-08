@@ -101,9 +101,3 @@ backend/    FastAPI app, the Ava agent, RAG pipeline, and document generation
 frontend/   React (Vite) single-chat UI
 uploads/    sample CVs for local testing (gitignored; runtime uploads are parsed in memory, not stored)
 ```
-
-## Notes
-
-Chat sessions live in memory and generated files under `backend/generated/` aren't
-auto-pruned, so restarting the server clears chat state. Fine for local use; add
-persistence and cleanup before deploying.
