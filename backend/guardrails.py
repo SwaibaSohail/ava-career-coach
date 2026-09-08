@@ -2,7 +2,7 @@
 
 Stages run cheapest-first so junk is rejected at ~$0. Stages 1-4 are pure
 Python; only stage 5 (check_input_llm) makes a paid API call, and it runs only
-if 1-4 pass. See docs/superpowers/specs/2026-09-05-ingress-guardrails-design.md.
+if 1-4 pass.
 """
 
 import re
@@ -59,8 +59,9 @@ def detect_dialect(message: str) -> str:
 
 # --- Stage 3: regex injection gate -------------------------------------------
 
-# Phrases that only make sense as commands aimed at an AI, not as chat/CV text.
-# Single source of truth: cv_processor.sanitize_cv_text imports INJECTION_RE.
+# BROAD set - scrubs an uploaded CV FILE (cv_processor imports INJECTION_RE).
+# A CV is pure data, so ANY imperative aimed at an AI in it is suspicious; this
+# set is aggressive and also catches "you must include ...", "do not mention ...".
 INJECTION_PATTERNS = [
     r"ignore\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|faithfulness|honesty|guidelines?|polic\w+)",
     r"disregard\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|above|previous|prior)",
@@ -73,17 +74,35 @@ INJECTION_PATTERNS = [
     r"(?:do not|don't|must not|shall not|never)\s+(?:mention|tell|reveal|show|disclose|inform)\b",
     r"(?:do not|don't|must not|never)\s+(?:question|verify|check|fact[\s-]?check|challenge)\b",
     r"\bwithout\s+(?:questioning|verifying|checking)\b",
-    r"\bas an ai\b",
+    r"\bas an ai\b[\s,]*(?:assistant|model|language model|you\b)",
     r"\bnew\s+instructions?\s*[:.]",
     r"\bpretend\s+(?:to be|you(?:'re| are))\b",
     r"\b(?:jailbreak|no\s+restrictions|without\s+restrictions|unrestricted mode)\b",
 ]
 INJECTION_RE = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
 
+# STRICT set - gates CHAT messages. In chat the user legitimately instructs Ava
+# ("don't mention my gap year", "you should not include my phone number"), so we
+# block ONLY phrases that try to reprogram the assistant - never content requests.
+CHAT_INJECTION_PATTERNS = [
+    r"ignore\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|faithfulness|honesty|guidelines?|polic\w+)",
+    r"disregard\b[\w\s,'-]{0,40}\b(?:instructions?|rules?|prompts?|above|previous|prior)",
+    r"forget\b[\w\s,'-]{0,40}\b(?:instructions?|rules?)",
+    r"system\s*(?:instruction|override|prompt)s?\b",
+    r"developer\s*(?:mode|override)\b",
+    r"(?:instruction|message|note|command)s?\s+(?:to|for)\s+(?:the\s+)?(?:ai|assistant|model|llm|chatbot|system|language model)\b",
+    r"\byou\s+(?:are|must|should|shall|will)\s+now\b",
+    r"\bas an ai\b[\s,]*(?:assistant|model|language model|you\b)",
+    r"\bnew\s+instructions?\s*[:.]",
+    r"\bpretend\s+(?:to be|you(?:'re| are))\b",
+    r"\b(?:jailbreak|no\s+restrictions|without\s+restrictions|unrestricted mode)\b",
+]
+CHAT_INJECTION_RE = re.compile("|".join(CHAT_INJECTION_PATTERNS), re.IGNORECASE)
+
 
 def check_injection(message: str) -> bool:
-    """True if the message looks like a prompt-injection command."""
-    return bool(INJECTION_RE.search(message or ""))
+    """True if a CHAT message tries to reprogram the assistant (strict set)."""
+    return bool(CHAT_INJECTION_RE.search(message or ""))
 
 
 # --- Stage 4: rule-based abuse / spam gate -----------------------------------
