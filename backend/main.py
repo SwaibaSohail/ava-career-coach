@@ -11,6 +11,7 @@ import tempfile
 import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -58,19 +59,44 @@ def start_session():
     return SessionResponse(session_id=session_id, greeting=AVA_GREETING)
 
 
+def _ensure_pdf(content: bytes) -> None:
+    """Reject empty, oversized, or non-PDF uploads with a friendly 400."""
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    if len(content) > config.MAX_UPLOAD_BYTES:
+        mb = config.MAX_UPLOAD_BYTES // (1024 * 1024)
+        raise HTTPException(status_code=400, detail=f"That file is too large (max {mb} MB).")
+    if not content.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="That doesn't look like a PDF. Please upload a PDF CV.")
+
+
+def _process_cv(session, pdf_path: str) -> None:
+    """Blocking CV parse + embed. Run off the event loop via run_in_threadpool."""
+    session.vector_store = build_cv_vector_store(load_and_chunk_cv(pdf_path))
+    session.cv_text = extract_full_text(pdf_path)
+    session.has_cv = True
+    # Fresh memory so earlier draft/example CVs can't leak into tailoring.
+    session.thread_id = str(uuid.uuid4())
+
+
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
-    """Attach a CV PDF: chunk + embed it and remember its text for this session."""
+    """Attach a CV PDF: validate it, chunk + embed it, and remember its text."""
     session = _require(session_id)
+    content = await file.read()
+    _ensure_pdf(content)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(await file.read())
+        tmp.write(content)
         pdf_path = tmp.name
     try:
-        session.vector_store = build_cv_vector_store(load_and_chunk_cv(pdf_path))
-        session.cv_text = extract_full_text(pdf_path)
-        session.has_cv = True
-        # Fresh memory so earlier draft/example CVs can't leak into tailoring.
-        session.thread_id = str(uuid.uuid4())
+        await run_in_threadpool(_process_cv, session, pdf_path)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't read that PDF — it may be corrupted, encrypted, or password-protected.",
+        )
     finally:
         os.unlink(pdf_path)
     return UploadResponse(ok=True, filename=file.filename or "cv.pdf", chars=len(session.cv_text))
@@ -79,7 +105,9 @@ async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
 async def _message_events(session, user_message: str):
     """Yield SSE frames for one turn. Runs the ingress guardrails first; a
     blocked message streams a canned reply and never reaches the agent."""
-    guard = guard_incoming(user_message)
+    # Runs the (possibly LLM-backed) guard off the event loop so it can't block
+    # other requests.
+    guard = await run_in_threadpool(guard_incoming, user_message)
     if not guard.allowed:
         yield f"data: {json.dumps({'type': 'token', 'text': guard.safe_reply})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
