@@ -22,6 +22,13 @@ MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "8000"))
 # Reject uploaded files larger than this (bytes) before parsing. Default 10 MB.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 
+# SMTP (outbound email). Port 587 + STARTTLS only; secrets stay in .env.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "") or SMTP_USER
+
 # Local embedding model — runs on-device, no API key or cost.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -35,3 +42,7 @@ def is_api_key_configured() -> bool:
 
 def is_tavily_configured() -> bool:
     return bool(TAVILY_API_KEY) and TAVILY_API_KEY != "your_tavily_api_key_here"
+
+
+def is_smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
