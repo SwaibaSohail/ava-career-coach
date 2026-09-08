@@ -17,3 +17,13 @@ class UploadResponse(BaseModel):
     ok: bool
     filename: str
     chars: int
+
+
+class ActionRequest(BaseModel):
+    session_id: str
+    action_id: str
+
+
+class ActionResponse(BaseModel):
+    status: str
+    error: str | None = None

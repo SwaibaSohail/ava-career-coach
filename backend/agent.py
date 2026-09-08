@@ -205,6 +205,7 @@ async def stream_ava(session, user_message: str):
     """Stream one turn as ('token', text) chunks, then any ('document', info),
     then ('done', None). Powers the SSE endpoint."""
     before = set(session.documents)
+    before_actions = set(session.pending_actions)
     agent = _build_ava(session)
     buffer = []
     try:
@@ -237,4 +238,8 @@ async def stream_ava(session, user_message: str):
         if doc_id not in before:
             doc = session.documents[doc_id]
             yield ("document", {"id": doc.id, "kind": doc.kind, "title": doc.title})
+    for aid in session.pending_actions:
+        if aid not in before_actions:
+            a = session.pending_actions[aid]
+            yield ("action", {"id": a.id, "kind": a.kind, **a.params})
     yield ("done", None)

@@ -16,12 +16,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 import config
+from actions import execute_email
+from config import is_smtp_configured
 from cv_processor import load_and_chunk_cv, extract_full_text
 from vector_store import build_cv_vector_store
 from agent import stream_ava, AVA_GREETING
 from guardrails import guard_incoming
-from schemas import MessageRequest, SessionResponse, UploadResponse
-from session_store import create_session, find_document, get_session
+from schemas import (
+    ActionRequest,
+    ActionResponse,
+    MessageRequest,
+    SessionResponse,
+    UploadResponse,
+)
+from session_store import create_session, find_document, find_pending_action, get_session
 
 app = FastAPI(title="Ava — CV & Job Coach API")
 
@@ -49,7 +57,11 @@ def root():
 
 @app.get("/api/config")
 def read_config():
-    return {"groq": config.is_api_key_configured(), "tavily": config.is_tavily_configured()}
+    return {
+        "groq": config.is_api_key_configured(),
+        "tavily": config.is_tavily_configured(),
+        "smtp": is_smtp_configured(),
+    }
 
 
 @app.post("/api/session", response_model=SessionResponse)
@@ -126,7 +138,7 @@ async def _message_events(session, user_message: str):
         payload = {"type": kind}
         if kind == "token":
             payload["text"] = data
-        elif kind == "document":
+        elif kind in ("document", "action"):
             payload.update(data)
         yield f"data: {json.dumps(payload)}\n\n"
 
@@ -159,3 +171,31 @@ def download(doc_id: str, fmt: str = "docx"):
         path, media, ext = doc.docx_path, _DOCX_MEDIA, ".docx"
     filename = (doc.title or doc.kind).replace(" ", "_") + ext
     return FileResponse(path, filename=filename, media_type=media)
+
+
+@app.post("/api/action/confirm", response_model=ActionResponse)
+async def confirm_action(req: ActionRequest):
+    """Run an approved action (send the email). SMTP happens only here."""
+    session = _require(req.session_id)
+    action = find_pending_action(session, req.action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="Action not found.")
+    if not is_smtp_configured():
+        return ActionResponse(
+            status=action.status,
+            error="Email isn't set up — add SMTP settings to .env.",
+        )
+    result = await run_in_threadpool(execute_email, action)
+    return ActionResponse(status=result.status, error=result.error)
+
+
+@app.post("/api/action/cancel", response_model=ActionResponse)
+async def cancel_action(req: ActionRequest):
+    """Discard a pending/failed action so it can't be sent."""
+    session = _require(req.session_id)
+    action = find_pending_action(session, req.action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="Action not found.")
+    if action.status in ("pending", "failed"):
+        action.status = "cancelled"
+    return ActionResponse(status=action.status, error=action.error)

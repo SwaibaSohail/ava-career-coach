@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 
@@ -157,3 +158,79 @@ def test_propose_email_tool_reports_bad_recipient():
     out = tools["propose_email"].invoke({"to": "nope", "subject": "Hi", "body": "Hello."})
     assert s.pending_actions == {}
     assert "valid" in out.lower() or "address" in out.lower()
+
+
+def _collect(agen):
+    async def run():
+        return [x async for x in agen]
+    return asyncio.run(run())
+
+
+def test_message_events_emits_action_and_no_smtp(monkeypatch):
+    import main
+    import agent
+    from langchain_core.messages import AIMessageChunk
+    from session_store import PendingAction
+
+    def fake_build(session):
+        class FakeAgent:
+            async def astream(self, *a, **k):
+                session.pending_actions["e1"] = PendingAction(
+                    id="e1", kind="email",
+                    params={"to": "jobs@acme.com", "subject": "Hi", "body": "Hello."})
+                yield (AIMessageChunk(content="Drafted."), {})
+        return FakeAgent()
+    monkeypatch.setattr(agent, "_build_ava", fake_build)
+    sent = []
+    monkeypatch.setattr(actions, "send_email_smtp", lambda *a, **k: sent.append(1))
+
+    frames = "".join(_collect(main._message_events(Session(), "email jobs@acme.com")))
+    assert '"type": "action"' in frames and "jobs@acme.com" in frames
+    assert '"type": "done"' in frames
+    assert sent == []
+
+
+def test_confirm_endpoint_sends(monkeypatch):
+    import main
+    from session_store import create_session
+    monkeypatch.setattr(main, "is_smtp_configured", lambda: True)
+    calls = []
+
+    def fake_exec(a):
+        a.status = "sent"
+        calls.append(1)
+        return a
+    monkeypatch.setattr(main, "execute_email", fake_exec)
+    sid, session = create_session()
+    a = actions.build_email_action(session, "jobs@acme.com", "Hi", "Hello.")
+    res = asyncio.run(main.confirm_action(main.ActionRequest(session_id=sid, action_id=a.id)))
+    assert res.status == "sent" and calls == [1]
+
+
+def test_confirm_endpoint_reports_unconfigured(monkeypatch):
+    import main
+    from session_store import create_session
+    monkeypatch.setattr(main, "is_smtp_configured", lambda: False)
+    sid, session = create_session()
+    a = actions.build_email_action(session, "jobs@acme.com", "Hi", "Hello.")
+    res = asyncio.run(main.confirm_action(main.ActionRequest(session_id=sid, action_id=a.id)))
+    assert res.status == "pending" and res.error
+
+
+def test_cancel_endpoint_cancels_pending():
+    import main
+    from session_store import create_session
+    sid, session = create_session()
+    a = actions.build_email_action(session, "jobs@acme.com", "Hi", "Hello.")
+    res = asyncio.run(main.cancel_action(main.ActionRequest(session_id=sid, action_id=a.id)))
+    assert res.status == "cancelled"
+
+
+def test_cancel_does_not_unsend():
+    import main
+    from session_store import create_session
+    sid, session = create_session()
+    a = actions.build_email_action(session, "jobs@acme.com", "Hi", "Hello.")
+    a.status = "sent"
+    res = asyncio.run(main.cancel_action(main.ActionRequest(session_id=sid, action_id=a.id)))
+    assert res.status == "sent"
