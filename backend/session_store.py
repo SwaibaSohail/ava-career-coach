@@ -19,12 +19,22 @@ class Document:
 
 
 @dataclass
+class PendingAction:
+    id: str
+    kind: str                 # "email"
+    params: dict              # e.g. {"to", "subject", "body"}
+    status: str = "pending"   # pending | sending | sent | cancelled | failed
+    error: str | None = None
+
+
+@dataclass
 class Session:
     vector_store: object = None
     cv_text: str = ""
     has_cv: bool = False
     thread_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    documents: dict = field(default_factory=dict)  # id -> Document
+    documents: dict = field(default_factory=dict)         # id -> Document
+    pending_actions: dict = field(default_factory=dict)   # id -> PendingAction
 
 
 _sessions: dict[str, Session] = {}
@@ -46,3 +56,8 @@ def find_document(doc_id: str) -> Document | None:
         if doc:
             return doc
     return None
+
+
+def find_pending_action(session: Session, action_id: str) -> PendingAction | None:
+    """Look up a pending action within one session (not a global scan)."""
+    return session.pending_actions.get(action_id)
