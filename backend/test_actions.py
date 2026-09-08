@@ -137,3 +137,23 @@ def test_execute_email_failure_sets_failed(monkeypatch):
     a = _pending(s)
     actions.execute_email(a)
     assert a.status == "failed" and "smtp down" in (a.error or "")
+
+
+def test_propose_email_tool_creates_pending_without_sending(monkeypatch):
+    calls = []
+    monkeypatch.setattr(actions, "send_email_smtp", lambda *a, **k: calls.append(1))
+    from agent import _session_tools
+    s = Session()
+    tools = {t.name: t for t in _session_tools(s)}
+    out = tools["propose_email"].invoke({"to": "jobs@acme.com", "subject": "Hi", "body": "Hello."})
+    assert len(s.pending_actions) == 1
+    assert "approve" in out.lower() and calls == []
+
+
+def test_propose_email_tool_reports_bad_recipient():
+    from agent import _session_tools
+    s = Session()
+    tools = {t.name: t for t in _session_tools(s)}
+    out = tools["propose_email"].invoke({"to": "nope", "subject": "Hi", "body": "Hello."})
+    assert s.pending_actions == {}
+    assert "valid" in out.lower() or "address" in out.lower()

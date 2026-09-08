@@ -20,6 +20,7 @@ from vector_store import get_relevant_cv_text
 from documents import build_document
 from session_store import Document
 from prompts import ava_system_prompt
+from actions import build_email_action
 
 _checkpointer = InMemorySaver()
 
@@ -85,7 +86,25 @@ def _session_tools(session):
             return "No CV has been uploaded yet."
         return get_relevant_cv_text(session.vector_store, query, k=6)
 
-    return [save_document, search_cv]
+    @tool
+    def propose_email(to: str, subject: str, body: str) -> str:
+        """Draft an email for the user to review and approve before it is sent.
+
+        Args:
+            to: recipient email address the user provided.
+            subject: email subject line.
+            body: plain-text email body.
+        """
+        try:
+            action = build_email_action(session, to, subject, body)
+        except ValueError as exc:
+            return f"Couldn't draft the email: {exc} Ask the user to correct it."
+        return (
+            f"Email drafted for the user to review and approve (id: {action.id}). "
+            "It is NOT sent; wait for the user to approve the card."
+        )
+
+    return [save_document, search_cv, propose_email]
 
 
 def _build_ava(session):
