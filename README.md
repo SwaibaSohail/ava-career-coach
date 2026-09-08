@@ -76,6 +76,24 @@ Open http://localhost:5173
 | GET | `/api/document/{id}` | Download a generated document (`?fmt=pdf` or `?fmt=docx`) |
 | GET | `/api/config` | Which API keys are configured |
 
+## Testing
+
+Backend tests run with **pytest**. From `backend/` with the virtualenv active:
+
+```bash
+pytest
+```
+
+Most tests are offline and fast. The prompt-injection suite also has a few
+end-to-end checks that call the live LLM; they're skipped by default and run
+only when you opt in:
+
+```bash
+RUN_LLM_TESTS=1 pytest test_injection.py
+```
+
+On Windows PowerShell, set the flag first: `$env:RUN_LLM_TESTS=1; pytest test_injection.py`.
+
 ## Project layout
 
 ```
