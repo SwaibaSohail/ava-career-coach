@@ -32,3 +32,27 @@ def test_pending_action_store_roundtrip():
     assert find_pending_action(s, "a1") is a
     assert find_pending_action(s, "nope") is None
     assert a.status == "pending" and a.error is None
+
+
+def test_build_email_action_stores_pending():
+    import actions
+    from session_store import Session
+    s = Session()
+    a = actions.build_email_action(s, "jobs@acme.com", "Application", "Hello there.")
+    assert a.status == "pending" and a.kind == "email"
+    assert s.pending_actions[a.id] is a
+    assert a.params == {"to": "jobs@acme.com", "subject": "Application", "body": "Hello there."}
+
+
+@pytest.mark.parametrize("to,subject,body", [
+    ("not-an-email", "Hi", "Body"),
+    ("jobs@acme.com", "Sub\r\nBcc: evil@x.com", "Body"),  # header injection
+    ("jobs@acme.com", "Hi", "x" * 20001),                 # oversized body
+])
+def test_build_email_action_rejects_bad_input(to, subject, body):
+    import actions
+    from session_store import Session
+    s = Session()
+    with pytest.raises(ValueError):
+        actions.build_email_action(s, to, subject, body)
+    assert s.pending_actions == {}
