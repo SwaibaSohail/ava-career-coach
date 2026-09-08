@@ -15,6 +15,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GUARD_MODEL = os.getenv("GUARD_MODEL", "llama-3.1-8b-instant")
 GUARD_LLM_ENABLED = os.getenv("GUARD_LLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
+# Max characters kept from an incoming chat message before it reaches the agent.
+# Generous enough to fit a pasted job description; still caps absurd payloads.
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "8000"))
+
 # Local embedding model — runs on-device, no API key or cost.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 

@@ -23,7 +23,7 @@ class GuardResult:
 
 # --- Stage 1: length + control-char truncate ---------------------------------
 
-def truncate(message: str, max_chars: int = 500) -> str:
+def truncate(message: str, max_chars: int = config.MAX_MESSAGE_CHARS) -> str:
     """Cap length and strip control characters (keep newlines and tabs)."""
     text = message or ""
     text = "".join(

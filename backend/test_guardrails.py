@@ -15,7 +15,8 @@ from guardrails import (
 
 
 def test_truncate_caps_length():
-    assert len(truncate("a" * 600)) == 500
+    from config import MAX_MESSAGE_CHARS
+    assert len(truncate("a" * (MAX_MESSAGE_CHARS + 500))) == MAX_MESSAGE_CHARS
 
 
 def test_truncate_strips_control_chars_but_keeps_newlines():
