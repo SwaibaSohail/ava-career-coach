@@ -1,5 +1,7 @@
 """RAG retrieval: embed CV chunks locally and store/query them in ChromaDB."""
 
+import uuid
+
 from langchain_chroma import Chroma
 from langchain_community.embeddings import FastEmbedEmbeddings
 
@@ -17,11 +19,17 @@ def get_embeddings() -> FastEmbedEmbeddings:
 
 
 def build_cv_vector_store(chunks: list) -> Chroma:
-    """Store the CV chunks in a fresh in-memory collection (one per upload)."""
+    """Store the CV chunks in their own per-upload collection.
+
+    A unique collection name isolates each upload: chromadb shares one in-memory
+    system across clients, so a fixed name would let a second upload (or another
+    session) retrieve an earlier CV's chunks. A fresh name per upload prevents
+    that cross-contamination.
+    """
     return Chroma.from_documents(
         documents=chunks,
         embedding=get_embeddings(),
-        collection_name="cv_collection",
+        collection_name=f"cv_{uuid.uuid4().hex}",
     )
 
 
