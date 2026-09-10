@@ -20,9 +20,14 @@ export async function uploadCv(sessionId, file) {
   return res.json(); // { ok, filename, chars }
 }
 
-// Streams Ava's reply. Calls onToken(text) per delta and onDocument(info) when a
-// file is saved. Resolves when the stream closes.
-export async function streamMessage(sessionId, message, { onToken, onDocument }) {
+// Streams Ava's reply. Calls onToken(text) per delta, onDocument(info) when a
+// file is saved, and onAction(info) when Ava drafts an email awaiting approval.
+// Resolves when the stream closes.
+export async function streamMessage(
+  sessionId,
+  message,
+  { onToken, onDocument = () => {}, onAction = () => {} }
+) {
   const res = await fetch(BASE + "/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -52,6 +57,8 @@ export async function streamMessage(sessionId, message, { onToken, onDocument })
       }
       if (evt.type === "token") onToken(evt.text);
       else if (evt.type === "document") onDocument({ id: evt.id, kind: evt.kind, title: evt.title });
+      else if (evt.type === "action")
+        onAction({ id: evt.id, kind: evt.kind, to: evt.to, subject: evt.subject, body: evt.body });
     }
   }
 }
@@ -59,3 +66,24 @@ export async function streamMessage(sessionId, message, { onToken, onDocument })
 export function documentUrl(id, fmt = "docx") {
   return `${BASE}/document/${id}?fmt=${fmt}`;
 }
+
+export async function getConfig() {
+  const res = await fetch(BASE + "/config");
+  return res.ok ? res.json() : {};
+}
+
+async function actionPost(path, sessionId, actionId) {
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, action_id: actionId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || "Action failed");
+  return data; // { status, error }
+}
+
+export const confirmAction = (sessionId, actionId) =>
+  actionPost("/action/confirm", sessionId, actionId);
+export const cancelAction = (sessionId, actionId) =>
+  actionPost("/action/cancel", sessionId, actionId);
