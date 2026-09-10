@@ -257,3 +257,99 @@ body {
   opacity: 0.5;
   cursor: default;
 }
+
+/* ---- Email action (Approve/Cancel) card ---- */
+.action-card {
+  margin-top: 0.7rem;
+  padding: 0.7rem 0.8rem;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.action-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.action-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.action-field {
+  font-size: 0.85rem;
+  margin: 0.15rem 0;
+}
+.action-field span {
+  display: inline-block;
+  min-width: 3.5rem;
+  color: var(--muted);
+}
+.action-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  font-size: 0.85rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  margin: 0.4rem 0 0.2rem;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.action-link {
+  background: none;
+  border: none;
+  color: var(--brand);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0;
+  cursor: pointer;
+}
+.action-btns {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  flex-wrap: wrap;
+}
+.action-approve {
+  background: var(--brand);
+  color: var(--brand-ink);
+  border: none;
+  border-radius: 8px;
+  font: inherit;
+  font-weight: 600;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+}
+.action-cancel {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+.action-approve:disabled,
+.action-cancel:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.action-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.action-status {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.action-sent {
+  color: #4ea87a;
+}
+.action-cancelled {
+  color: var(--muted);
+}

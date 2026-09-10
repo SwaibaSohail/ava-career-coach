@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import Message from "./components/Message.jsx";
 import Composer from "./components/Composer.jsx";
-import { startSession, uploadCv, streamMessage } from "./api.js";
+import { startSession, uploadCv, streamMessage, getConfig } from "./api.js";
 
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [busy, setBusy] = useState(false); // streaming or uploading
   const [error, setError] = useState("");
+  const [smtpConfigured, setSmtpConfigured] = useState(false);
   const endRef = useRef(null);
 
   // Open a session and show Ava's greeting.
@@ -18,6 +19,8 @@ export default function App() {
         setMessages([{ role: "assistant", content: d.greeting }]);
       })
       .catch(() => setError("Couldn't reach the backend. Is it running on http://localhost:8000?"));
+    // Whether the server can actually send email (controls the Approve button).
+    getConfig().then((c) => setSmtpConfigured(!!c.smtp)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -43,6 +46,7 @@ export default function App() {
       await streamMessage(sessionId, backendMessage, {
         onToken: (t) => patchLast((m) => ({ ...m, content: m.content + t })),
         onDocument: (doc) => patchLast((m) => ({ ...m, documents: [...(m.documents || []), doc] })),
+        onAction: (action) => patchLast((m) => ({ ...m, actions: [...(m.actions || []), action] })),
       });
     } catch {
       patchLast((m) => ({
@@ -87,6 +91,8 @@ export default function App() {
             key={i}
             message={m}
             streaming={busy && i === messages.length - 1 && m.role === "assistant"}
+            sessionId={sessionId}
+            smtpConfigured={smtpConfigured}
           />
         ))}
         <div ref={endRef} />
