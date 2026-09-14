@@ -95,11 +95,13 @@ def _session_tools(session):
             to: recipient email address the user provided.
             subject: email subject line.
             body: plain-text email body.
-            attach: optional — set to "cv" or "cover_letter" to attach the
-                document of that kind you saved earlier with save_document (it is
-                attached as a PDF). The document MUST already be saved. Set this
-                ONLY when the user asked to attach or send that document; leave it
-                empty otherwise.
+            attach: optional — which document to attach as a PDF. Use "cv" to
+                attach the user's CV: this attaches a CV you saved with
+                save_document if there is one, otherwise the CV the user
+                uploaded. Use "cover_letter" for a saved cover letter, or
+                "uploaded" to force the originally uploaded CV even when a
+                tailored one exists. Set this ONLY when the user asked to attach
+                or send the document; leave it empty otherwise.
         """
         try:
             action = build_email_action(session, to, subject, body, attach)

@@ -139,6 +139,64 @@ def test_execute_email_passes_attachments(monkeypatch, tmp_path):
     assert captured["attachments"] and captured["attachments"][0]["filename"].endswith(".pdf")
 
 
+def _set_uploaded_cv(session, name="Sara_CV.pdf"):
+    session.cv_pdf = b"%PDF-1.4 uploaded cv bytes"
+    session.cv_filename = name
+    session.has_cv = True
+
+
+def test_attach_cv_falls_back_to_uploaded_when_no_document():
+    from session_store import Session
+    s = Session()
+    _set_uploaded_cv(s)
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    att = a.attachments[0]
+    assert att["kind"] == "cv"
+    assert att["filename"] == "Sara_CV.pdf"
+    assert att.get("data") == b"%PDF-1.4 uploaded cv bytes"  # in-memory, no disk path
+    assert "path" not in att
+
+
+def test_attach_cv_prefers_generated_over_uploaded(tmp_path):
+    from session_store import Session
+    s = Session()
+    _set_uploaded_cv(s)
+    path = _register_doc(s, tmp_path)  # a generated CV also exists
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    att = a.attachments[0]
+    assert att.get("path") == path        # the generated doc wins
+    assert att.get("data") is None
+
+
+def test_attach_uploaded_forces_original(tmp_path):
+    from session_store import Session
+    s = Session()
+    _set_uploaded_cv(s)
+    _register_doc(s, tmp_path)  # generated CV exists but we force the upload
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="uploaded")
+    assert a.attachments[0].get("data") == b"%PDF-1.4 uploaded cv bytes"
+
+
+def test_attach_uploaded_without_upload_raises():
+    from session_store import Session
+    s = Session()
+    with pytest.raises(ValueError):
+        actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="uploaded")
+    assert s.pending_actions == {}
+
+
+def test_build_email_message_includes_in_memory_attachment():
+    from session_store import Session
+    s = Session()
+    _set_uploaded_cv(s)
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    msg = actions.build_email_message(a.params["to"], a.params["subject"], a.params["body"], a.attachments)
+    atts = list(msg.iter_attachments())
+    assert len(atts) == 1
+    assert atts[0].get_filename() == "Sara_CV.pdf"
+    assert atts[0].get_content_type() == "application/pdf"
+
+
 def _pending(s):
     return actions.build_email_action(s, "jobs@acme.com", "Application", "Hello there.")
 

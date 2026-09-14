@@ -91,7 +91,7 @@ def _ensure_pdf(content: bytes) -> None:
         raise HTTPException(status_code=400, detail="That doesn't look like a PDF. Please upload a PDF CV.")
 
 
-def _process_cv(session, pdf_path: str) -> None:
+def _process_cv(session, pdf_path: str, content: bytes, filename: str) -> None:
     """Blocking CV parse + embed. Run off the event loop via run_in_threadpool."""
     # Build the new store first so a parse failure leaves the old CV intact.
     new_store = build_cv_vector_store(load_and_chunk_cv(pdf_path))
@@ -100,6 +100,9 @@ def _process_cv(session, pdf_path: str) -> None:
     session.vector_store = new_store
     session.cv_text = cv_text
     session.has_cv = True
+    # Keep the original PDF bytes in memory so Ava can attach the uploaded CV.
+    session.cv_pdf = content
+    session.cv_filename = filename or "cv.pdf"
     # Fresh memory so earlier draft/example CVs can't leak into tailoring.
     session.thread_id = str(uuid.uuid4())
     # Drop the previous upload's collection so it doesn't linger in memory.
@@ -120,7 +123,7 @@ async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
         tmp.write(content)
         pdf_path = tmp.name
     try:
-        await run_in_threadpool(_process_cv, session, pdf_path)
+        await run_in_threadpool(_process_cv, session, pdf_path, content, file.filename or "cv.pdf")
     except HTTPException:
         raise
     except Exception:

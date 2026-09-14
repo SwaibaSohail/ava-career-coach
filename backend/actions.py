@@ -37,30 +37,8 @@ def _latest_document(session, kind: str):
     return None
 
 
-def _resolve_attachment(session, ref: str) -> dict:
-    """Turn an attachment reference into a safe {path, filename, kind}.
-
-    `ref` is either a document kind ('cv' / 'cover_letter' — the reliable path
-    the model uses) or an exact session document id. Only documents Ava
-    generated in THIS session can be attached — the path is read from the stored
-    Document, never from the model or the client, so an arbitrary filesystem
-    path can't be smuggled in.
-    """
-    doc = session.documents.get(ref)  # exact id?
-    if doc is None:
-        key = (ref or "").strip().lower()
-        if "cover" in key:
-            kind = "cover_letter"
-        elif key in ("cv", "resume") or "cv" in key or "resume" in key:
-            kind = "cv"
-        else:
-            raise ValueError(
-                "I'm not sure which document to attach — save the CV first, then attach it."
-            )
-        doc = _latest_document(session, kind)
-        if doc is None:
-            nice = kind.replace("_", " ")
-            raise ValueError(f"There's no saved {nice} to attach yet — save it first, then attach.")
+def _document_attachment(doc) -> dict:
+    """A safe attachment for a document Ava generated (read from disk at send time)."""
     if not doc.pdf_path or not os.path.exists(doc.pdf_path):
         raise ValueError("That document's file isn't available to attach. Try regenerating it.")
     return {
@@ -68,6 +46,58 @@ def _resolve_attachment(session, ref: str) -> dict:
         "filename": _safe_filename(doc.title, doc.kind, ".pdf"),
         "kind": doc.kind,
     }
+
+
+def _uploaded_cv_attachment(session):
+    """A safe attachment for the CV the user uploaded (kept in memory, not on disk)."""
+    data = getattr(session, "cv_pdf", None)
+    if not data:
+        return None
+    raw = getattr(session, "cv_filename", "") or "CV.pdf"
+    base = raw[:-4] if raw.lower().endswith(".pdf") else raw
+    return {"data": data, "filename": _safe_filename(base, "cv", ".pdf"), "kind": "cv"}
+
+
+def _resolve_attachment(session, ref: str) -> dict:
+    """Turn an attachment reference into a safe attachment dict.
+
+    `ref` is a document kind ('cv' / 'cover_letter' — the reliable path the model
+    uses), the special value 'uploaded' for the CV the user uploaded, or an exact
+    session document id. For 'cv', a CV Ava generated is preferred, falling back
+    to the uploaded original. Only session documents or the uploaded CV can be
+    attached — the source is read from server-side state, never from a path the
+    model or client supplies, so an arbitrary filesystem path can't be smuggled in.
+    """
+    doc = session.documents.get(ref)  # exact id?
+    if doc is not None:
+        return _document_attachment(doc)
+
+    key = (ref or "").strip().lower()
+    if key in ("uploaded", "uploaded_cv", "original", "original_cv"):
+        att = _uploaded_cv_attachment(session)
+        if att is None:
+            raise ValueError("There's no uploaded CV to attach — upload one first, then attach.")
+        return att
+
+    if "cover" in key:
+        kind = "cover_letter"
+    elif key in ("cv", "resume") or "cv" in key or "resume" in key:
+        kind = "cv"
+    else:
+        raise ValueError(
+            "I'm not sure which document to attach — save or upload the CV first, then attach."
+        )
+
+    doc = _latest_document(session, kind)
+    if doc is not None:
+        return _document_attachment(doc)
+    # No generated CV — fall back to the uploaded original.
+    if kind == "cv":
+        att = _uploaded_cv_attachment(session)
+        if att is not None:
+            return att
+    nice = kind.replace("_", " ")
+    raise ValueError(f"There's no {nice} to attach yet — create or upload it first, then attach.")
 
 
 def build_email_action(
@@ -114,8 +144,11 @@ def build_email_message(to: str, subject: str, body: str, attachments=None) -> E
     msg["Subject"] = subject
     msg.set_content(body)
     for att in attachments or []:
-        with open(att["path"], "rb") as fh:
-            data = fh.read()
+        if att.get("data") is not None:
+            data = att["data"]           # uploaded CV: bytes kept in memory
+        else:
+            with open(att["path"], "rb") as fh:
+                data = fh.read()         # generated document: read from disk
         maintype, subtype = _media_for(att["filename"])
         msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=att["filename"])
     return msg

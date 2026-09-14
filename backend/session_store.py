@@ -35,6 +35,9 @@ class Session:
     vector_store: object = None
     cv_text: str = ""
     has_cv: bool = False
+    # The original uploaded CV, kept in memory (not on disk) so Ava can attach it.
+    cv_pdf: bytes | None = None
+    cv_filename: str = ""
     thread_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     documents: dict = field(default_factory=dict)         # id -> Document
     pending_actions: dict = field(default_factory=dict)   # id -> PendingAction
