@@ -29,6 +29,11 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "") or SMTP_USER
 
+# MCP: servers config file (resolved against backend/) and a cap on how much
+# text an MCP tool may feed back to the model.
+MCP_SERVERS_FILE = os.getenv("MCP_SERVERS_FILE", "mcp_servers.json")
+MCP_MAX_OUTPUT_CHARS = int(os.getenv("MCP_MAX_OUTPUT_CHARS", "4000"))
+
 # Local embedding model — runs on-device, no API key or cost.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 

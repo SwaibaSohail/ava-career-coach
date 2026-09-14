@@ -20,3 +20,6 @@ dist/
 
 # Generated documents (CVs / cover letters)
 generated/
+
+# MCP servers config (may contain tokens) — keep the .example, not the real one
+backend/mcp_servers.json
