@@ -88,20 +88,26 @@ def _session_tools(session):
         return get_relevant_cv_text(session.vector_store, query, k=6)
 
     @tool
-    def propose_email(to: str, subject: str, body: str) -> str:
+    def propose_email(to: str, subject: str, body: str, attach: str = "") -> str:
         """Draft an email for the user to review and approve before it is sent.
 
         Args:
             to: recipient email address the user provided.
             subject: email subject line.
             body: plain-text email body.
+            attach: optional — set to "cv" or "cover_letter" to attach the
+                document of that kind you saved earlier with save_document (it is
+                attached as a PDF). The document MUST already be saved. Set this
+                ONLY when the user asked to attach or send that document; leave it
+                empty otherwise.
         """
         try:
-            action = build_email_action(session, to, subject, body)
+            action = build_email_action(session, to, subject, body, attach)
         except ValueError as exc:
             return f"Couldn't draft the email: {exc} Ask the user to correct it."
+        note = f" Attached: {action.attachments[0]['filename']}." if action.attachments else ""
         return (
-            f"Email drafted for the user to review and approve (id: {action.id}). "
+            f"Email drafted for the user to review and approve (id: {action.id}).{note} "
             "It is NOT sent; wait for the user to approve the card."
         )
 
@@ -242,5 +248,7 @@ async def stream_ava(session, user_message: str):
     for aid in session.pending_actions:
         if aid not in before_actions:
             a = session.pending_actions[aid]
-            yield ("action", {"id": a.id, "kind": a.kind, **a.params})
+            # Send only display info to the client — never the server file path.
+            attachments = [{"filename": at["filename"], "kind": at["kind"]} for at in a.attachments]
+            yield ("action", {"id": a.id, "kind": a.kind, **a.params, "attachments": attachments})
     yield ("done", None)

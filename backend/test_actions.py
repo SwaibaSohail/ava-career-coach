@@ -61,6 +61,84 @@ def test_build_email_action_rejects_bad_input(to, subject, body):
     assert s.pending_actions == {}
 
 
+def _register_doc(session, tmp_path, doc_id="d1", title="Frontend Developer CV", kind="cv"):
+    """Add a fake generated document with a real PDF file on disk."""
+    from session_store import Document
+    p = tmp_path / f"{doc_id}.pdf"
+    p.write_bytes(b"%PDF-1.4 fake pdf bytes")
+    session.documents[doc_id] = Document(
+        id=doc_id, kind=kind, title=title, content="...",
+        docx_path=str(tmp_path / f"{doc_id}.docx"), pdf_path=str(p),
+    )
+    return str(p)
+
+
+def test_build_email_action_attaches_cv_by_kind(tmp_path):
+    from session_store import Session
+    s = Session()
+    path = _register_doc(s, tmp_path)
+    # Attach by KIND — the reliable path the model uses (no id threading).
+    a = actions.build_email_action(s, "jobs@acme.com", "Application", "Hi.", attach="cv")
+    # The plain fields are unchanged; the path stays out of params.
+    assert a.params == {"to": "jobs@acme.com", "subject": "Application", "body": "Hi."}
+    assert len(a.attachments) == 1
+    att = a.attachments[0]
+    assert att["path"] == path
+    assert att["filename"] == "Frontend_Developer_CV.pdf"
+    assert att["kind"] == "cv"
+
+
+def test_build_email_action_attaches_by_exact_id(tmp_path):
+    from session_store import Session
+    s = Session()
+    _register_doc(s, tmp_path)
+    a = actions.build_email_action(s, "jobs@acme.com", "Application", "Hi.", attach="d1")
+    assert a.attachments[0]["kind"] == "cv"
+
+
+def test_build_email_action_attaches_latest_of_kind(tmp_path):
+    from session_store import Session
+    s = Session()
+    _register_doc(s, tmp_path, doc_id="d1", title="Old CV")
+    _register_doc(s, tmp_path, doc_id="d2", title="New CV")
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    assert a.attachments[0]["filename"] == "New_CV.pdf"
+
+
+def test_build_email_action_no_saved_doc_raises():
+    from session_store import Session
+    s = Session()
+    with pytest.raises(ValueError):
+        actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    assert s.pending_actions == {}
+
+
+def test_build_email_message_includes_pdf_attachment(tmp_path):
+    from session_store import Session
+    s = Session()
+    _register_doc(s, tmp_path)
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    msg = actions.build_email_message(a.params["to"], a.params["subject"], a.params["body"], a.attachments)
+    atts = list(msg.iter_attachments())
+    assert len(atts) == 1
+    assert atts[0].get_filename() == "Frontend_Developer_CV.pdf"
+    assert atts[0].get_content_type() == "application/pdf"
+
+
+def test_execute_email_passes_attachments(monkeypatch, tmp_path):
+    captured = {}
+    def fake_send(to, subject, body, attachments=None):
+        captured["attachments"] = attachments
+    monkeypatch.setattr(actions, "send_email_smtp", fake_send)
+    from session_store import Session
+    s = Session()
+    _register_doc(s, tmp_path)
+    a = actions.build_email_action(s, "jobs@acme.com", "Hi", "Body", attach="cv")
+    actions.execute_email(a)
+    assert a.status == "sent"
+    assert captured["attachments"] and captured["attachments"][0]["filename"].endswith(".pdf")
+
+
 def _pending(s):
     return actions.build_email_action(s, "jobs@acme.com", "Application", "Hello there.")
 
@@ -160,6 +238,20 @@ def test_propose_email_tool_reports_bad_recipient():
     assert "valid" in out.lower() or "address" in out.lower()
 
 
+def test_propose_email_tool_attaches_document(tmp_path):
+    from agent import _session_tools
+    s = Session()
+    _register_doc(s, tmp_path)
+    tools = {t.name: t for t in _session_tools(s)}
+    out = tools["propose_email"].invoke(
+        {"to": "jobs@acme.com", "subject": "Hi", "body": "Hello.", "attach": "cv"}
+    )
+    action = next(iter(s.pending_actions.values()))
+    assert len(action.attachments) == 1
+    assert action.attachments[0]["filename"] == "Frontend_Developer_CV.pdf"
+    assert "Frontend_Developer_CV.pdf" in out
+
+
 def _collect(agen):
     async def run():
         return [x async for x in agen]
@@ -188,6 +280,31 @@ def test_message_events_emits_action_and_no_smtp(monkeypatch):
     assert '"type": "action"' in frames and "jobs@acme.com" in frames
     assert '"type": "done"' in frames
     assert sent == []
+
+
+def test_action_event_exposes_filename_not_path(monkeypatch):
+    import main
+    import agent
+    from langchain_core.messages import AIMessageChunk
+    from session_store import PendingAction
+
+    secret_path = "C:/secret/server/path/cv.pdf"
+
+    def fake_build(session):
+        class FakeAgent:
+            async def astream(self, *a, **k):
+                session.pending_actions["e1"] = PendingAction(
+                    id="e1", kind="email",
+                    params={"to": "jobs@acme.com", "subject": "Hi", "body": "Hello."},
+                    attachments=[{"path": secret_path, "filename": "My_CV.pdf", "kind": "cv"}],
+                )
+                yield (AIMessageChunk(content="Drafted."), {})
+        return FakeAgent()
+    monkeypatch.setattr(agent, "_build_ava", fake_build)
+
+    frames = "".join(_collect(main._message_events(Session(), "email my cv")))
+    assert "My_CV.pdf" in frames        # filename is shown to the client
+    assert secret_path not in frames     # server path is never sent
 
 
 def test_confirm_endpoint_sends(monkeypatch):

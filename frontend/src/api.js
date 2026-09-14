@@ -58,7 +58,14 @@ export async function streamMessage(
       if (evt.type === "token") onToken(evt.text);
       else if (evt.type === "document") onDocument({ id: evt.id, kind: evt.kind, title: evt.title });
       else if (evt.type === "action")
-        onAction({ id: evt.id, kind: evt.kind, to: evt.to, subject: evt.subject, body: evt.body });
+        onAction({
+          id: evt.id,
+          kind: evt.kind,
+          to: evt.to,
+          subject: evt.subject,
+          body: evt.body,
+          attachments: evt.attachments || [],
+        });
     }
   }
 }

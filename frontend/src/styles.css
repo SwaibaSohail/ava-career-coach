@@ -307,6 +307,25 @@ body {
   padding: 0;
   cursor: pointer;
 }
+.action-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.5rem 0 0.2rem;
+}
+.action-attach {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  font-size: 0.8rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .action-btns {
   display: flex;
   align-items: center;

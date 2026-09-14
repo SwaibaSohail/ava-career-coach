@@ -4,6 +4,7 @@
 `execute_email` performs the SMTP send, guarded so one action can't send twice.
 """
 
+import os
 import re
 import smtplib
 import threading
@@ -17,9 +18,67 @@ _MAX_BODY = 20000
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _send_lock = threading.Lock()
 
+_PDF_MEDIA = ("application", "pdf")
+_DOCX_MEDIA = ("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-def build_email_action(session, to: str, subject: str, body: str) -> PendingAction:
-    """Validate and store a pending email. Raises ValueError on bad input."""
+
+def _safe_filename(title: str, kind: str, ext: str) -> str:
+    """A clean download-style filename, e.g. 'Frontend_Developer_CV.pdf'."""
+    base = (title or kind or "document").strip().replace(" ", "_")
+    base = re.sub(r"[^A-Za-z0-9_.\-]", "", base) or "document"
+    return base + ext
+
+
+def _latest_document(session, kind: str):
+    """Most recently saved session document of a kind ('cv' | 'cover_letter')."""
+    for doc in reversed(list(session.documents.values())):
+        if doc.kind == kind:
+            return doc
+    return None
+
+
+def _resolve_attachment(session, ref: str) -> dict:
+    """Turn an attachment reference into a safe {path, filename, kind}.
+
+    `ref` is either a document kind ('cv' / 'cover_letter' — the reliable path
+    the model uses) or an exact session document id. Only documents Ava
+    generated in THIS session can be attached — the path is read from the stored
+    Document, never from the model or the client, so an arbitrary filesystem
+    path can't be smuggled in.
+    """
+    doc = session.documents.get(ref)  # exact id?
+    if doc is None:
+        key = (ref or "").strip().lower()
+        if "cover" in key:
+            kind = "cover_letter"
+        elif key in ("cv", "resume") or "cv" in key or "resume" in key:
+            kind = "cv"
+        else:
+            raise ValueError(
+                "I'm not sure which document to attach — save the CV first, then attach it."
+            )
+        doc = _latest_document(session, kind)
+        if doc is None:
+            nice = kind.replace("_", " ")
+            raise ValueError(f"There's no saved {nice} to attach yet — save it first, then attach.")
+    if not doc.pdf_path or not os.path.exists(doc.pdf_path):
+        raise ValueError("That document's file isn't available to attach. Try regenerating it.")
+    return {
+        "path": doc.pdf_path,
+        "filename": _safe_filename(doc.title, doc.kind, ".pdf"),
+        "kind": doc.kind,
+    }
+
+
+def build_email_action(
+    session, to: str, subject: str, body: str, attach: str = ""
+) -> PendingAction:
+    """Validate and store a pending email. Raises ValueError on bad input.
+
+    If `attach` is given (a document kind like 'cv'/'cover_letter', or an exact
+    document id), the matching session document is attached as a PDF; if none
+    matches, ValueError is raised and nothing is stored.
+    """
     to = (to or "").strip()
     subject = (subject or "").strip()
     body = body or ""
@@ -30,22 +89,41 @@ def build_email_action(session, to: str, subject: str, body: str) -> PendingActi
         raise ValueError(f"'{to}' is not a valid email address.")
     if len(body) > _MAX_BODY:
         raise ValueError(f"The email body is too long (max {_MAX_BODY} characters).")
+    attachments = []
+    if attach:
+        attachments.append(_resolve_attachment(session, attach))
     action = PendingAction(
         id=uuid.uuid4().hex,
         kind="email",
         params={"to": to, "subject": subject, "body": body},
+        attachments=attachments,
     )
     session.pending_actions[action.id] = action
     return action
 
 
-def send_email_smtp(to: str, subject: str, body: str) -> None:
-    """Send one plain-text email via SMTP (587 + STARTTLS). Raises on failure."""
+def _media_for(filename: str):
+    return _DOCX_MEDIA if filename.lower().endswith(".docx") else _PDF_MEDIA
+
+
+def build_email_message(to: str, subject: str, body: str, attachments=None) -> EmailMessage:
+    """Assemble a plain-text email with optional file attachments."""
     msg = EmailMessage()
     msg["From"] = config.SMTP_FROM
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(body)
+    for att in attachments or []:
+        with open(att["path"], "rb") as fh:
+            data = fh.read()
+        maintype, subtype = _media_for(att["filename"])
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=att["filename"])
+    return msg
+
+
+def send_email_smtp(to: str, subject: str, body: str, attachments=None) -> None:
+    """Send one email (with any attachments) via SMTP (587 + STARTTLS). Raises on failure."""
+    msg = build_email_message(to, subject, body, attachments)
     with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=20) as smtp:
         smtp.starttls()
         smtp.login(config.SMTP_USER, config.SMTP_PASSWORD)
@@ -63,7 +141,12 @@ def execute_email(action: PendingAction) -> PendingAction:
         action.status = "sending"
         action.error = None
     try:
-        send_email_smtp(action.params["to"], action.params["subject"], action.params["body"])
+        send_email_smtp(
+            action.params["to"],
+            action.params["subject"],
+            action.params["body"],
+            action.attachments,
+        )
         action.status = "sent"
     except Exception as exc:
         action.status = "failed"

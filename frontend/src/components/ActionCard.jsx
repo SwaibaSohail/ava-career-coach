@@ -12,6 +12,7 @@ export default function ActionCard({ action, sessionId, smtpConfigured }) {
   const body = action.body || "";
   const long = body.length > PREVIEW;
   const shown = showFull || !long ? body : body.slice(0, PREVIEW) + "…";
+  const attachments = action.attachments || [];
 
   async function run(fn) {
     setBusy(true);
@@ -42,6 +43,16 @@ export default function ActionCard({ action, sessionId, smtpConfigured }) {
         <button className="action-link" onClick={() => setShowFull((v) => !v)}>
           {showFull ? "Show less" : "Show full"}
         </button>
+      )}
+
+      {attachments.length > 0 && (
+        <div className="action-attachments">
+          {attachments.map((att, i) => (
+            <span className="action-attach" key={i} title={att.filename}>
+              📎 {att.filename}
+            </span>
+          ))}
+        </div>
       )}
 
       {open ? (

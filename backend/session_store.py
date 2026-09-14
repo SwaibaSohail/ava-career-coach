@@ -25,6 +25,9 @@ class PendingAction:
     params: dict              # e.g. {"to", "subject", "body"}
     status: str = "pending"   # pending | sending | sent | cancelled | failed
     error: str | None = None
+    # Resolved server-side files to attach: [{"path", "filename", "kind"}].
+    # The path never leaves the server; only the filename is shown to the client.
+    attachments: list = field(default_factory=list)
 
 
 @dataclass
