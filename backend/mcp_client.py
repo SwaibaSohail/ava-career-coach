@@ -6,6 +6,7 @@ expose `coroutine`), so they can only be called from async code (Ava's astream /
 chat_with_ava's asyncio.run), never synchronously.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -63,3 +64,44 @@ def _guard_tool(tool):
         description=tool.description,
         args_schema=tool.args_schema,
     )
+
+
+_BUILTIN_TOOL_NAMES = {
+    "web_search", "job_search", "search_cv", "save_document", "propose_email",
+}
+_cache: list = []
+
+
+async def _fetch_tools(servers: dict) -> list:
+    """Connect to the configured servers and return their raw tools."""
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+    client = MultiServerMCPClient(servers)
+    return await client.get_tools()
+
+
+async def load_mcp_tools_async() -> list:
+    servers = _load_servers()
+    if not servers:
+        return []
+    try:
+        raw = await asyncio.wait_for(_fetch_tools(servers), timeout=20)
+    except Exception as exc:
+        log.warning("MCP disabled (could not load tools): %s", exc)
+        return []
+    tools = []
+    for t in raw:
+        if t.name in _BUILTIN_TOOL_NAMES:
+            log.warning("MCP: dropping tool %r (collides with a built-in)", t.name)
+            continue
+        tools.append(_guard_tool(t))
+    log.info("MCP: loaded %d tool(s) from %d server(s)", len(tools), len(servers))
+    return tools
+
+
+async def init_mcp() -> None:
+    global _cache
+    _cache = await load_mcp_tools_async()
+
+
+def get_mcp_tools() -> list:
+    return _cache

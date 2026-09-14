@@ -57,3 +57,44 @@ def test_guard_tool_clamps_output(monkeypatch):
     assert wrapped.name == "big"
     out = asyncio.run(wrapped.ainvoke({"url": "http://x"}))
     assert out.endswith("…[truncated]") and len(out) <= 50 + len("\n…[truncated]")
+
+
+class _FakeTool:
+    def __init__(self, name):
+        from pydantic import create_model
+        self.name = name
+        self.description = "fake"
+        self.args_schema = create_model("Args", url=(str, "x"))
+    async def ainvoke(self, kwargs):
+        return "ok"
+
+
+def test_load_tools_empty_when_not_configured(monkeypatch):
+    monkeypatch.setattr(mcp_client, "_load_servers", lambda: {})
+    assert asyncio.run(mcp_client.load_mcp_tools_async()) == []
+
+
+def test_load_tools_failsafe_on_error(monkeypatch):
+    monkeypatch.setattr(mcp_client, "_load_servers", lambda: {"fetch": {}})
+    async def boom(servers):
+        raise RuntimeError("uvx not found")
+    monkeypatch.setattr(mcp_client, "_fetch_tools", boom)
+    assert asyncio.run(mcp_client.load_mcp_tools_async()) == []
+
+
+def test_load_tools_drops_duplicate_names(monkeypatch):
+    monkeypatch.setattr(mcp_client, "_load_servers", lambda: {"fetch": {}})
+    async def fake(servers):
+        return [_FakeTool("fetch"), _FakeTool("search_cv")]  # 2nd collides with a built-in
+    monkeypatch.setattr(mcp_client, "_fetch_tools", fake)
+    names = {t.name for t in asyncio.run(mcp_client.load_mcp_tools_async())}
+    assert "fetch" in names and "search_cv" not in names
+
+
+def test_init_and_get_cache(monkeypatch):
+    monkeypatch.setattr(mcp_client, "_load_servers", lambda: {"fetch": {}})
+    async def fake(servers):
+        return [_FakeTool("fetch")]
+    monkeypatch.setattr(mcp_client, "_fetch_tools", fake)
+    asyncio.run(mcp_client.init_mcp())
+    assert [t.name for t in mcp_client.get_mcp_tools()] == ["fetch"]
