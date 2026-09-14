@@ -10,9 +10,14 @@ import json
 import logging
 import os
 
+from langchain_core.tools import StructuredTool
+
 import config
+from cv_processor import sanitize_cv_text
 
 log = logging.getLogger(__name__)
+
+_TRUNC = "\n…[truncated]"
 
 
 def _servers_path() -> str:
@@ -36,3 +41,25 @@ def _load_servers() -> dict:
 
 def is_mcp_configured() -> bool:
     return bool(_load_servers())
+
+
+def _clamp_output(text: str) -> str:
+    """Treat MCP output as untrusted data: scrub injection lines, then cap size."""
+    cleaned = sanitize_cv_text(text or "")
+    if len(cleaned) > config.MCP_MAX_OUTPUT_CHARS:
+        cleaned = cleaned[: config.MCP_MAX_OUTPUT_CHARS] + _TRUNC
+    return cleaned
+
+
+def _guard_tool(tool):
+    """Wrap an MCP tool so its string result is sanitized + capped."""
+    async def _run(**kwargs):
+        result = await tool.ainvoke(kwargs)
+        return _clamp_output(result) if isinstance(result, str) else result
+
+    return StructuredTool.from_function(
+        coroutine=_run,
+        name=tool.name,
+        description=tool.description,
+        args_schema=tool.args_schema,
+    )
