@@ -44,19 +44,33 @@ def is_mcp_configured() -> bool:
     return bool(_load_servers())
 
 
-def _clamp_output(text: str) -> str:
-    """Treat MCP output as untrusted data: scrub injection lines, then cap size."""
-    cleaned = sanitize_cv_text(text or "")
+def _to_text(result) -> str:
+    """Coerce an MCP tool result (a string, or a list of content blocks) to text."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        parts = []
+        for block in result:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(str(block["text"]))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(result)
+
+
+def _clamp_output(result) -> str:
+    """Treat MCP output as untrusted data: to text, scrub injection lines, cap size."""
+    cleaned = sanitize_cv_text(_to_text(result))
     if len(cleaned) > config.MCP_MAX_OUTPUT_CHARS:
         cleaned = cleaned[: config.MCP_MAX_OUTPUT_CHARS] + _TRUNC
     return cleaned
 
 
 def _guard_tool(tool):
-    """Wrap an MCP tool so its string result is sanitized + capped."""
+    """Wrap an MCP tool so its result is coerced to text, sanitized, and capped."""
     async def _run(**kwargs):
-        result = await tool.ainvoke(kwargs)
-        return _clamp_output(result) if isinstance(result, str) else result
+        return _clamp_output(await tool.ainvoke(kwargs))
 
     return StructuredTool.from_function(
         coroutine=_run,
