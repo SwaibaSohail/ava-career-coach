@@ -98,3 +98,15 @@ def test_init_and_get_cache(monkeypatch):
     monkeypatch.setattr(mcp_client, "_fetch_tools", fake)
     asyncio.run(mcp_client.init_mcp())
     assert [t.name for t in mcp_client.get_mcp_tools()] == ["fetch"]
+
+
+def test_build_ava_includes_mcp_tools(monkeypatch):
+    import agent
+    from session_store import Session
+    sentinel = _FakeTool("mcp_sentinel")
+    monkeypatch.setattr(agent, "get_mcp_tools", lambda: [sentinel])
+    captured = {}
+    monkeypatch.setattr(agent, "create_agent", lambda **kw: captured.update(kw) or "AGENT")
+    agent._build_ava(Session())
+    names = {getattr(t, "name", None) for t in captured["tools"]}
+    assert "mcp_sentinel" in names

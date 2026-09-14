@@ -21,6 +21,7 @@ from documents import build_document
 from session_store import Document
 from prompts import ava_system_prompt
 from actions import build_email_action
+from mcp_client import get_mcp_tools
 
 _checkpointer = InMemorySaver()
 
@@ -110,7 +111,7 @@ def _session_tools(session):
 def _build_ava(session):
     return create_agent(
         model=get_llm(temperature=0.3),
-        tools=get_tools() + _session_tools(session),
+        tools=get_tools() + _session_tools(session) + get_mcp_tools(),
         system_prompt=_ava_system_prompt(session),
         checkpointer=_checkpointer,
         name="ava",

@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -22,6 +23,7 @@ from cv_processor import load_and_chunk_cv, extract_full_text
 from vector_store import build_cv_vector_store
 from agent import stream_ava, AVA_GREETING
 from guardrails import guard_incoming
+from mcp_client import init_mcp
 from schemas import (
     ActionRequest,
     ActionResponse,
@@ -31,7 +33,14 @@ from schemas import (
 )
 from session_store import create_session, find_document, find_pending_action, get_session
 
-app = FastAPI(title="Ava — CV & Job Coach API")
+@asynccontextmanager
+async def _lifespan(app):
+    # Load MCP tools once at startup (fail-safe: never blocks the app on error).
+    await init_mcp()
+    yield
+
+
+app = FastAPI(title="Ava — CV & Job Coach API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,

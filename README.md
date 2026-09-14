@@ -66,6 +66,20 @@ npm run dev
 
 Open http://localhost:5173
 
+### MCP tools (optional)
+
+Ava can use external [MCP](https://modelcontextprotocol.io) servers. Install
+[`uv`](https://docs.astral.sh/uv/) (provides `uvx`), then copy
+`backend/mcp_servers.example.json` to `backend/mcp_servers.json`. The example
+enables the **Fetch** server, so Ava can read a job posting from a URL and tailor
+against it.
+
+Notes: `uvx` must be on the PATH of the process running the backend. Fetch
+respects `robots.txt` and can't run JavaScript, so static pages (Greenhouse,
+Lever, Workable, most company career pages) work well; LinkedIn/Indeed/Glassdoor
+often don't — paste the text in those cases. Each fetch call spawns the server
+(~1–3s). If MCP isn't configured, Ava runs exactly as before.
+
 ## API
 
 | Method | Route | Purpose |
