@@ -1,11 +1,13 @@
 import asyncio
 import contextvars
 import hashlib
+import json
 import logging
 import sqlite3
 
 import pytest
 from fastapi.concurrency import run_in_threadpool
+from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from pydantic import BaseModel
@@ -430,3 +432,210 @@ def test_interview_calls_are_tagged_by_step(groq_llm, monkeypatch):
     assert [(r["client_id"], r["feature"]) for r in _rows()] == [
         ("acme", "interview.questions"), ("acme", "interview.score"), ("acme", "interview.report"),
     ]
+
+
+# --- Client keys, allowances and the admin report (HTTP) ------------------
+
+@pytest.fixture
+def api(monkeypatch):
+    """The app without its lifespan (so no MCP servers) and an empty session store."""
+    import main
+    import session_store
+    monkeypatch.setattr(session_store, "_sessions", {})
+    return TestClient(main.app)
+
+
+def _start(api, key=None):
+    res = api.post("/api/session", headers={"X-Client-Key": key} if key else {})
+    assert res.status_code == 200, res.text
+    return res.json()["session_id"]
+
+
+def _send(api, sid, text):
+    res = api.post("/api/message", json={"session_id": sid, "message": text})
+    assert res.status_code == 200, res.text
+    return [json.loads(line[len("data: "):]) for line in res.text.splitlines() if line.startswith("data: ")]
+
+
+def _reply(frames):
+    return "".join(f["text"] for f in frames if f["type"] == "token")
+
+
+def _must_not_run(*args, **kwargs):
+    raise AssertionError("no model may run once the allowance is used up")
+
+
+def test_session_without_key_uses_default_client(api):
+    import session_store
+    sid = _start(api)
+    assert session_store.get_session(sid).client_id == "default"
+    assert session_store.get_session(sid).id == sid
+
+
+def test_session_with_valid_key_is_bound_to_client(api):
+    import session_store
+    cid, key = metering.add_client("Acme", "starter")
+    sid = _start(api, key)
+    assert session_store.get_session(sid).client_id == cid
+
+
+def test_session_with_unknown_key_is_rejected(api):
+    import session_store
+    assert api.post("/api/session", headers={"X-Client-Key": "ava_nope"}).status_code == 401
+    assert session_store._sessions == {}
+
+
+def test_session_requires_key_when_configured(api, monkeypatch):
+    monkeypatch.setattr(config, "REQUIRE_CLIENT_KEY", True)
+    assert api.post("/api/session").status_code == 401
+    _, key = metering.add_client("Acme", "starter")
+    assert api.post("/api/session", headers={"X-Client-Key": key}).status_code == 200
+
+
+def test_client_key_lookup_fails_open(api, monkeypatch, caplog):
+    import session_store
+
+    def boom(key):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(metering, "client_for_key", boom)
+    sid = _start(api, "ava_anything")
+    assert session_store.get_session(sid).client_id == "default"
+    assert "key lookup failed" in caplog.text
+
+
+def test_over_limit_streams_notice_without_calling_a_model(api, monkeypatch):
+    import main
+    _, key = metering.add_client("Acme", "suspended")
+    sid = _start(api, key)
+    monkeypatch.setattr(main, "guard_incoming", _must_not_run)
+    monkeypatch.setattr(main, "stream_ava", _must_not_run)
+    frames = _send(api, sid, "Please tailor my CV for a backend role")
+    assert [f["type"] for f in frames] == ["token", "done"]
+    assert "allowance" in frames[0]["text"]
+    assert _rows() == []
+
+
+def test_used_up_monthly_allowance_is_enforced(api, monkeypatch):
+    import main
+    cid, key = metering.add_client("Acme", "free")
+    sid = _start(api, key)
+    _record_for(cid, 100_000)
+    monkeypatch.setattr(main, "guard_incoming", _must_not_run)
+    monkeypatch.setattr(main, "stream_ava", _must_not_run)
+    assert "allowance" in _reply(_send(api, sid, "Hello again"))
+
+
+def test_over_limit_also_gates_interview_turns(api, monkeypatch):
+    import main
+    import session_store
+    _, key = metering.add_client("Acme", "suspended")
+    sid = _start(api, key)
+    it = session_store.InterviewSession(
+        id="iv1", role="Python Developer", job_summary="Builds APIs.",
+        questions=[session_store.InterviewQuestion(text="Tell me about an API you built.", kind="technical")])
+    session_store.get_session(sid).interview = it
+    for name in ("guard_incoming", "handle_turn", "stream_ava"):
+        monkeypatch.setattr(main, name, _must_not_run)
+    frames = _send(api, sid, "I built a payments API in FastAPI.")
+    assert [f["type"] for f in frames] == ["token", "done"]
+    assert "allowance" in frames[0]["text"]
+    assert it.current == 0 and it.results == []
+
+
+def test_guard_call_is_billed_when_it_blocks(api, groq_llm, monkeypatch):
+    import main
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: groq_llm(content="INJECTION", **kw))
+    monkeypatch.setattr(main, "stream_ava", _must_not_run)
+    cid, key = metering.add_client("Acme", "starter")
+    sid = _start(api, key)
+    # Passes the regex stages, so only the (faked) LLM guard blocks it.
+    frames = _send(api, sid, "Please tell me about the weather today")
+    assert "follow instructions embedded" in _reply(frames) and frames[-1]["type"] == "done"
+    (row,) = _rows()
+    assert (row["feature"], row["client_id"], row["session_id"]) == ("guard", cid, sid)
+    assert row["model"] == config.GUARD_MODEL
+
+
+@pytest.fixture
+def fake_ava(groq_llm, monkeypatch):
+    """The real agent loop on a faked ChatGroq that always answers "Hello from Ava"."""
+    import agent
+    from langchain.agents import create_agent
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", False)
+    monkeypatch.setattr(agent, "_build_ava", lambda session: create_agent(
+        model=groq_llm(content="Hello from Ava", prompt_tokens=60, completion_tokens=4),
+        tools=[], system_prompt="x"))
+
+
+def test_chat_turn_is_billed_to_the_session_client(api, fake_ava):
+    cid, key = metering.add_client("Acme", "starter")
+    sid = _start(api, key)
+    frames = _send(api, sid, "Hi Ava")
+    assert "Hello from Ava" in _reply(frames) and frames[-1]["type"] == "done"
+    (row,) = _rows()
+    assert (row["client_id"], row["session_id"], row["feature"]) == (cid, sid, "chat")
+    assert (row["input_tokens"], row["output_tokens"]) == (60, 4)
+    assert metering.check_allowance(cid).used == 64
+
+
+def test_chat_still_streams_when_recording_fails(api, fake_ava, monkeypatch):
+    sid = _start(api)
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(metering, "record", boom)
+    assert "Hello from Ava" in _reply(_send(api, sid, "Hi Ava"))
+
+
+def test_chat_still_streams_when_the_ledger_is_down(api, fake_ava, monkeypatch, caplog):
+    sid = _start(api)
+
+    def boom():
+        raise sqlite3.OperationalError("unable to open database file")
+    monkeypatch.setattr(metering, "_connect", boom)
+    assert "Hello from Ava" in _reply(_send(api, sid, "Hi Ava"))
+    assert "allowance check failed" in caplog.text
+
+
+_ADMIN = {"X-Admin-Key": "s3cret-admin"}
+
+
+def test_admin_usage_is_closed_without_an_admin_key(api, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_API_KEY", "")
+    assert api.get("/api/admin/usage").status_code == 404
+    assert api.get("/api/admin/usage", headers=_ADMIN).status_code == 404
+
+
+def test_admin_usage_requires_the_right_key(api, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_API_KEY", "s3cret-admin")
+    assert api.get("/api/admin/usage").status_code == 401
+    assert api.get("/api/admin/usage", headers={"X-Admin-Key": "wrong"}).status_code == 401
+    res = api.get("/api/admin/usage", headers=_ADMIN)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["month"] == metering.month_bounds()[0] and body["timezone"] == "UTC"
+    assert isinstance(body["clients"], list) and isinstance(body["breakdown"], list)
+
+
+def test_admin_usage_rejects_a_bad_month(api, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_API_KEY", "s3cret-admin")
+    assert api.get("/api/admin/usage", params={"month": "2026-13"}, headers=_ADMIN).status_code == 400
+
+
+def test_admin_usage_filters_by_month_and_client(api, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_API_KEY", "s3cret-admin")
+    acme, _ = metering.add_client("Acme", "starter")
+    beta, _ = metering.add_client("Beta", "free")
+    _record_at(monkeypatch, "2026-10-06T09:00:00.000000Z", "openai/gpt-oss-120b", 10, 1, client_id=acme)
+    _record_at(monkeypatch, "2026-10-06T09:00:00.000000Z", "openai/gpt-oss-120b", 20, 2, client_id=beta)
+    body = api.get("/api/admin/usage", params={"month": "2026-10", "client_id": beta}, headers=_ADMIN).json()
+    assert body["month"] == "2026-10"
+    assert [(c["client_id"], c["used_tokens"]) for c in body["clients"]] == [(beta, 22)]
+    assert [r["client_id"] for r in body["breakdown"]] == [beta]
+
+
+def test_admin_usage_is_left_out_of_the_public_api_docs(api):
+    import main
+    assert "/api/admin/usage" in {getattr(route, "path", None) for route in main.app.routes}
+    assert "/api/admin/usage" not in api.get("/openapi.json").json()["paths"]

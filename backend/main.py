@@ -2,21 +2,26 @@
 
 Endpoints are thin wrappers around the conversational agent: start a session,
 attach a CV, exchange messages, and download the documents Ava generates.
-CORS is enabled for the React dev server on port 5173.
+Every model call is metered against the chat's client account (see metering.py);
+GET /api/admin/usage is the internal billing report. CORS is enabled for the
+React dev server on port 5173.
 """
 
 import json
+import logging
 import os
+import secrets
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 import config
+import metering
 from actions import execute_email
 from config import is_smtp_configured
 from cv_processor import load_and_chunk_cv, extract_full_text
@@ -33,6 +38,9 @@ from schemas import (
     UploadResponse,
 )
 from session_store import create_session, find_document, find_pending_action, get_session
+
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def _lifespan(app):
@@ -74,10 +82,32 @@ def read_config():
     }
 
 
+def _client_for_request(key: str | None) -> str:
+    """The client account a new chat bills to, from its X-Client-Key header."""
+    if not key:
+        if config.REQUIRE_CLIENT_KEY:
+            raise HTTPException(status_code=401, detail="A client key is required.")
+        return metering.DEFAULT_CLIENT
+    try:
+        client_id = metering.client_for_key(key)
+    except Exception:
+        # Fail open: never block chats on a metering outage.
+        log.error("metering: client key lookup failed; using the default client", exc_info=True)
+        return metering.DEFAULT_CLIENT
+    if client_id is None:
+        raise HTTPException(status_code=401, detail="Unknown client key.")
+    return client_id
+
+
 @app.post("/api/session", response_model=SessionResponse)
-def start_session():
-    """Begin a chat and return Ava's opening message."""
-    session_id, _ = create_session()
+def start_session(x_client_key: str | None = Header(default=None)):
+    """Begin a chat and return Ava's opening message.
+
+    An optional X-Client-Key header ties the chat to a client account for usage
+    metering. The key identifies the tenant (it may ship in a browser bundle);
+    it does not authenticate end users.
+    """
+    session_id, _ = create_session(client_id=_client_for_request(x_client_key))
     return SessionResponse(session_id=session_id, greeting=AVA_GREETING)
 
 
@@ -142,41 +172,56 @@ _INTERVIEW_STILL_RUNNING = (
     "type 'skip' or 'end interview'."
 )
 
+_LIMIT_REACHED = (
+    "Your organisation has used this month's Ava allowance, so I can't reply right "
+    "now. Please contact your administrator to raise the limit."
+)
+
 
 async def _message_events(session, user_message: str):
-    """Yield SSE frames for one turn. Runs the ingress guardrails first; a
-    blocked message streams a canned reply and never reaches the agent."""
-    # Runs the (possibly LLM-backed) guard off the event loop so it can't block
-    # other requests.
-    guard = await run_in_threadpool(guard_incoming, user_message)
-    interview = session.interview
-    interview_active = interview is not None and interview.status == "active"
-    if not guard.allowed:
-        reply = guard.safe_reply
+    """Yield SSE frames for one turn. Checks the client's monthly token allowance
+    first, then runs the ingress guardrails; a blocked message streams a canned
+    reply and never reaches the agent. Every model call in the turn is metered
+    under the session's client (the guard call is billed even when it blocks)."""
+    with metering.context(client_id=session.client_id, session_id=session.id or None, feature="chat"):
+        # Once per turn, before any model call. A turn that has started may
+        # finish, so a client can go slightly over its allowance.
+        allowance = await run_in_threadpool(metering.check_allowance, session.client_id)
+        if not allowance.allowed:
+            yield f"data: {json.dumps({'type': 'token', 'text': _LIMIT_REACHED})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+        # Runs the (possibly LLM-backed) guard off the event loop so it can't block
+        # other requests.
+        guard = await run_in_threadpool(guard_incoming, user_message)
+        interview = session.interview
+        interview_active = interview is not None and interview.status == "active"
+        if not guard.allowed:
+            reply = guard.safe_reply
+            if interview_active:
+                # The canned replies talk about CVs; make clear the interview hasn't moved on.
+                reply += _INTERVIEW_STILL_RUNNING
+            yield f"data: {json.dumps({'type': 'token', 'text': reply})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
         if interview_active:
-            # The canned replies talk about CVs; make clear the interview hasn't moved on.
-            reply += _INTERVIEW_STILL_RUNNING
-        yield f"data: {json.dumps({'type': 'token', 'text': reply})}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        return
-    if interview_active:
-        # Interview answers bypass the agent: a small focused evaluator handles them.
-        for kind, data in await run_in_threadpool(handle_turn, session, guard.cleaned_message):
+            # Interview answers bypass the agent: a small focused evaluator handles them.
+            for kind, data in await run_in_threadpool(handle_turn, session, guard.cleaned_message):
+                payload = {"type": kind}
+                if kind == "token":
+                    payload["text"] = data
+                else:
+                    payload.update(data)
+                yield f"data: {json.dumps(payload)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+        async for kind, data in stream_ava(session, guard.cleaned_message):
             payload = {"type": kind}
             if kind == "token":
                 payload["text"] = data
-            else:
+            elif kind in ("document", "action", "interview"):
                 payload.update(data)
             yield f"data: {json.dumps(payload)}\n\n"
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        return
-    async for kind, data in stream_ava(session, guard.cleaned_message):
-        payload = {"type": kind}
-        if kind == "token":
-            payload["text"] = data
-        elif kind in ("document", "action", "interview"):
-            payload.update(data)
-        yield f"data: {json.dumps(payload)}\n\n"
 
 
 @app.post("/api/message")
@@ -192,8 +237,10 @@ async def message(req: MessageRequest):
       - 'report'    the final interview report: role, readiness, band, answered,
                     skipped, total, strengths, improvements, per_question
       - 'done'      end of the turn
-    Incoming messages pass the Layer-1 ingress guardrails first. While an
-    interview is active, answers go to the interview engine instead of the agent.
+    Each turn first checks the client's monthly token allowance; over the limit,
+    a short notice is streamed and no model is called. Incoming messages then
+    pass the Layer-1 ingress guardrails. While an interview is active, answers
+    go to the interview engine instead of the agent.
     """
     session = _require(req.session_id)
     return StreamingResponse(
@@ -243,3 +290,23 @@ async def cancel_action(req: ActionRequest):
     if action.status in ("pending", "failed"):
         action.status = "cancelled"
     return ActionResponse(status=action.status, error=action.error)
+
+
+# Internal only: kept out of the public /docs page.
+@app.get("/api/admin/usage", include_in_schema=False)
+def admin_usage(month: str | None = None, client_id: str | None = None,
+                x_admin_key: str | None = Header(default=None)):
+    """Internal token-usage report for billing (UTC month; ?month=YYYY-MM).
+
+    Disabled (404) unless ADMIN_API_KEY is set; requires a matching X-Admin-Key.
+    """
+    if not config.ADMIN_API_KEY:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not x_admin_key or not secrets.compare_digest(
+        x_admin_key.encode("utf-8"), config.ADMIN_API_KEY.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid admin key.")
+    try:
+        return metering.usage_report(month=month, client_id=client_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

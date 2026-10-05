@@ -1,7 +1,8 @@
 """In-memory session state for the Ava chat.
 
 Each chat session keeps its uploaded CV (text + vector store), Ava's memory
-thread id, and any documents she has generated for download.
+thread id, any documents she has generated for download, and the client
+account its token usage is billed to.
 """
 
 import threading
@@ -62,6 +63,8 @@ class InterviewSession:
 
 @dataclass
 class Session:
+    id: str = ""
+    client_id: str = "default"            # metering: which client account this chat bills to
     vector_store: object = None
     cv_text: str = ""
     has_cv: bool = False
@@ -77,9 +80,9 @@ class Session:
 _sessions: dict[str, Session] = {}
 
 
-def create_session() -> tuple[str, Session]:
+def create_session(client_id: str = "default") -> tuple[str, Session]:
     session_id = str(uuid.uuid4())
-    _sessions[session_id] = Session()
+    _sessions[session_id] = Session(id=session_id, client_id=client_id)
     return session_id, _sessions[session_id]
 
 
