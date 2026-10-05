@@ -1,0 +1,9 @@
+{
+  "_note": "Monthly token allowance per plan (input + output tokens, calendar month in UTC). null = uncapped. Numbers are placeholders.",
+  "internal": {"monthly_tokens": null, "description": "Our own and development use. Recorded, never capped."},
+  "free": {"monthly_tokens": 100000},
+  "starter": {"monthly_tokens": 1000000},
+  "pro": {"monthly_tokens": 5000000},
+  "payg": {"monthly_tokens": null, "description": "Pay as you go: uncapped, billed per token from the usage report."},
+  "suspended": {"monthly_tokens": 0, "description": "Blocks the client without deleting its history."}
+}

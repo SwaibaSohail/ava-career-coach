@@ -21,5 +21,8 @@ dist/
 # Generated documents (CVs / cover letters)
 generated/
 
+# Usage ledger (internal billing data)
+backend/data/
+
 # MCP servers config (may contain tokens) — keep the .example, not the real one
 backend/mcp_servers.json

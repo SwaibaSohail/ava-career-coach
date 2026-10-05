@@ -45,6 +45,20 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 
+# Token usage metering (internal only — never shown to users). The ledger path
+# is resolved against backend/. Plans and model prices are editable JSON files;
+# restart the backend after editing them.
+METERING_DB = os.getenv("METERING_DB", "data/usage.db")
+PLANS_FILE = "plans.json"
+PRICING_FILE = "pricing.json"
+
+# Admin usage report (GET /api/admin/usage): closed (404) unless this is set.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+# When true, POST /api/session must carry a valid X-Client-Key header; when
+# false, chats without a key count under the uncapped built-in "default" client.
+REQUIRE_CLIENT_KEY = os.getenv("REQUIRE_CLIENT_KEY", "false").lower() in ("1", "true", "yes", "on")
+
 
 def is_api_key_configured() -> bool:
     return bool(GROQ_API_KEY) and GROQ_API_KEY != "your_groq_api_key_here"

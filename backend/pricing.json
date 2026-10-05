@@ -1,0 +1,6 @@
+{
+  "_note": "Our cost in USD per 1M tokens (Groq list prices checked 2026-10-06). Prompt-cache discounts are ignored, so costs may be slightly overestimated. A model missing here is recorded with cost null.",
+  "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},
+  "openai/gpt-oss-20b": {"input": 0.075, "output": 0.30},
+  "llama-3.1-8b-instant": {"input": 0.05, "output": 0.08}
+}
