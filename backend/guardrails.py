@@ -5,8 +5,10 @@ Python; only stage 5 (check_input_llm) makes a paid API call, and it runs only
 if 1-4 pass.
 """
 
+import math
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 
 import config
@@ -114,6 +116,39 @@ def check_injection(message: str) -> bool:
 # Starter profanity/slur set; extend with a maintained list over time.
 _PROFANITY = {"fuck", "fucking", "shit", "bitch", "asshole", "bastard", "cunt"}
 
+# Function words that naturally repeat in long prose (a STAR answer, a pasted
+# JD). They never count toward the repeated-word spam rule; words under 3
+# letters ("i", "a", "to") are skipped too.
+_FILLER_WORDS = {
+    "the", "and", "for", "with", "that", "you", "this", "was", "are", "our",
+    "have", "but", "not", "from", "they", "their", "will", "your",
+}
+_SPAM_MIN_REPEATS = 8      # a content word must appear at least this often...
+_SPAM_MIN_SHARE = 0.25     # ...and make up this share of all words
+# Lexical-diversity floor: distinct words must be at least this multiple of
+# sqrt(total words) (Guiraud's index). A short phrase looped over and over
+# ("buy cheap pills now" x20) scores below 1; real prose scores 5+ even at the
+# 8000-char cap. A flat distinct/total ratio would not work here: real text at
+# the cap drops to ~0.25 distinct/total.
+_SPAM_MIN_DIVERSITY_WORDS = 16
+_SPAM_MIN_DIVERSITY = 1.5
+
+
+def _is_repeated_word_spam(words: list[str]) -> bool:
+    """True when one word or a short looped phrase dominates the message
+    ("buy buy buy ...", "click here for free money" x30). Long prose that simply
+    reuses common words is not spam."""
+    if len(words) >= _SPAM_MIN_REPEATS and len(set(words)) <= 2:
+        return True  # "ha ha ha ...", "the the the ..."
+    if (
+        len(words) >= _SPAM_MIN_DIVERSITY_WORDS
+        and len(set(words)) < _SPAM_MIN_DIVERSITY * math.sqrt(len(words))
+    ):
+        return True  # a short phrase repeated many times
+    counts = Counter(w for w in words if len(w) >= 3 and w not in _FILLER_WORDS)
+    top = max(counts.values(), default=0)
+    return top >= _SPAM_MIN_REPEATS and top / len(words) >= _SPAM_MIN_SHARE
+
 
 def check_input(message: str) -> str | None:
     """Return 'abuse' or 'spam' if the message trips a rule, else None."""
@@ -127,7 +162,7 @@ def check_input(message: str) -> str | None:
         return "spam"
     if re.search(r"(.)\1{9,}", text):          # same char run >= 10
         return "spam"
-    if words and max(words.count(w) for w in set(words)) >= 8:  # one word spammed
+    if words and _is_repeated_word_spam(words):  # one word spammed
         return "spam"
     return None
 

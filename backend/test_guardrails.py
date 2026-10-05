@@ -141,6 +141,71 @@ def test_check_input_allows_clean_roman_urdu():
     assert check_input("mera cv theek karo bhai") is None
 
 
+# A realistic first-person STAR answer (100+ words): "I" and "the" each appear
+# 8+ times, as they do in any long answer. Must never be flagged as spam.
+LONG_STAR_ANSWER = (
+    "In my last role I was the backend lead on a payments team, and the checkout API "
+    "kept timing out during big sales. I was asked to fix it before the next campaign. "
+    "I started by profiling the service and I found that the database was doing a full "
+    "table scan on every order lookup. I added the right indexes, I moved the slow fraud "
+    "check to a background queue, and I set up dashboards so the team could see latency "
+    "in real time. I also wrote a runbook and I trained the on-call engineers. As a "
+    "result the p95 latency dropped from four seconds to 300 milliseconds, and the next "
+    "sale ran with zero downtime and no lost orders."
+)
+
+# A pasted job description (80+ words) with "the", "and" and "you" repeated.
+PASTED_JD = (
+    "Interview me for this job: We are hiring a Senior Data Engineer to join the "
+    "analytics team. You will design and build the pipelines that power the reporting "
+    "for the business, and you will own the quality of the warehouse. You will work "
+    "with the product team and the science team to define the metrics and the models. "
+    "Requirements: five years of experience with Python and SQL, experience with "
+    "Airflow and dbt, strong knowledge of the cloud, and the ability to explain the "
+    "trade-offs to the stakeholders. Experience with Spark and streaming is a plus. "
+    "You will report to the head of engineering."
+)
+
+
+def test_long_star_answer_is_not_spam():
+    assert len(LONG_STAR_ANSWER.split()) >= 100
+    assert check_input(LONG_STAR_ANSWER) is None
+
+
+def test_pasted_job_description_is_not_spam():
+    assert len(PASTED_JD.split()) >= 80
+    assert check_input(PASTED_JD) is None
+
+
+def test_long_answer_passes_full_guard(monkeypatch):
+    monkeypatch.setattr(app_config, "GUARD_LLM_ENABLED", False)  # no live classifier call
+    for text in (LONG_STAR_ANSWER, PASTED_JD):
+        assert guard_incoming(text).allowed is True
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        " ".join(["buy"] * 10),
+        " ".join(["buy now"] * 8),
+        "check this out " + " ".join(["promo"] * 10),
+        " ".join(["the"] * 10),  # a filler word alone is still junk
+        " ".join(["ha"] * 9),
+        # Looped phrases of 4+ distinct words: no single word dominates, but the
+        # message has almost no lexical variety.
+        " ".join(["buy cheap pills now"] * 20),
+        " ".join(["click here for free money"] * 30),
+        " ".join(["ha"] * 20) + " hello there",
+        # One content word making up ~29% of an otherwise varied message.
+        " ".join(["promo"] * 8)
+        + " we have great deals on shoes bags hats coats and more so visit our"
+        " store today to see every single",
+    ],
+)
+def test_check_input_still_flags_repeated_word_spam(msg):
+    assert check_input(msg) == "spam"
+
+
 def test_guard_incoming_blocks_abuse():
     result = guard_incoming("you are a fucking idiot")
     assert result.allowed is False
