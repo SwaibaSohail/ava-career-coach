@@ -72,6 +72,16 @@ class QuestionSet(BaseModel):
     questions: list[_Question]
 
 
+def _structured(schema, temperature: float):
+    """A model whose reply is constrained to `schema` (Groq json_schema mode).
+
+    The default tool-calling mode lets the model answer in plain prose instead
+    of calling the tool, which Groq rejects with a 400 ('tool_use_failed');
+    json_schema constrains decoding, so every reply matches the schema.
+    """
+    return get_llm(temperature=temperature).with_structured_output(schema, method="json_schema")
+
+
 def clamp_questions(n: int | None) -> int:
     """None/0 -> the configured default; otherwise clamp into [MIN, MAX]."""
     if not n:
@@ -96,7 +106,7 @@ def _generate_question_set(job_description: str, cv_text: str, n: int) -> Questi
         "technical/role-specific, behavioral and situational questions, ordered from "
         "warm-up to hardest. Also give the role title and a short job summary."
     )
-    model = get_llm(temperature=0.4).with_structured_output(QuestionSet)
+    model = _structured(QuestionSet, temperature=0.4)
     return model.invoke(prompt)
 
 
@@ -195,7 +205,7 @@ def _evaluate_answer(role: str, job_summary: str, question: str, answer: str) ->
         "role. A vague or off-topic answer scores low. Give one or two sentences of "
         "feedback: what worked and the single most useful improvement."
     )
-    model = get_llm(temperature=0.2).with_structured_output(Evaluation)
+    model = _structured(Evaluation, temperature=0.2)
     return model.invoke(prompt)
 
 
@@ -210,7 +220,7 @@ def _report_narrative(role: str, items: list[dict]) -> Narrative:
         f"Per-question results:\n<<<\n{lines}\n>>>\n\n"
         "List 2-3 strengths and 2-3 specific improvements, each a short phrase."
     )
-    model = get_llm(temperature=0.3).with_structured_output(Narrative)
+    model = _structured(Narrative, temperature=0.3)
     return model.invoke(prompt)
 
 

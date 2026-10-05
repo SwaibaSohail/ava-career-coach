@@ -772,11 +772,13 @@ class _FakeLLM:
     def __init__(self, result):
         self.result = result
         self.prompts = []
+        self.methods = []
 
     def __call__(self, *a, **k):
         return self
 
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, **kwargs):
+        self.methods.append(kwargs.get("method"))
         return self
 
     def invoke(self, prompt):
@@ -846,3 +848,16 @@ def test_tool_result_does_not_echo_the_generated_role(monkeypatch):
     out = tools["start_mock_interview"].invoke({"job_description": "A job."})
     assert "evil.example" not in out and "3 questions" in out
     assert s.interview.role.startswith("Dev'")
+
+
+def test_every_model_call_uses_json_schema_mode(monkeypatch):
+    # Regression: in tool-calling mode the model sometimes answered in prose,
+    # which Groq rejects (400 tool_use_failed) and every answer failed to score.
+    fake = _FakeLLM(_qset(3))
+    monkeypatch.setattr(interview, "get_llm", fake)
+    interview.start_interview(Session(), "A job posting.")
+    fake.result = interview.Evaluation(score=7, feedback="Good.")
+    interview._evaluate_answer("Dev", "Build.", "Q?", "A.")
+    fake.result = interview.Narrative(strengths=["a"], improvements=["b"])
+    interview._report_narrative("Dev", [{"question": "Q?", "score": 7, "feedback": "Ok."}])
+    assert fake.methods == ["json_schema", "json_schema", "json_schema"]
