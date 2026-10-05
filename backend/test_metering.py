@@ -3,7 +3,10 @@ import contextvars
 import hashlib
 import json
 import logging
+import os
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 from fastapi.concurrency import run_in_threadpool
@@ -16,6 +19,7 @@ import config
 import guardrails
 import interview
 import llm
+import manage_clients
 import metering
 
 
@@ -639,3 +643,89 @@ def test_admin_usage_is_left_out_of_the_public_api_docs(api):
     import main
     assert "/api/admin/usage" in {getattr(route, "path", None) for route in main.app.routes}
     assert "/api/admin/usage" not in api.get("/openapi.json").json()["paths"]
+
+
+def test_frontend_client_key_header_passes_cors(api):
+    # The browser preflights the frontend's X-Client-Key header on session start.
+    res = api.options("/api/session", headers={
+        "Origin": "http://localhost:5173", "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "x-client-key"})
+    assert res.status_code == 200
+    assert "x-client-key" in res.headers["access-control-allow-headers"].lower()
+
+
+# --- Admin CLI (manage_clients.py) ------------------------------------------
+
+def test_cli_add_list_set_plan_and_usage(capsys):
+    assert manage_clients.main(["add", "Acme Ltd", "--plan", "starter"]) == 0
+    out = capsys.readouterr().out
+    key = next(w for w in out.split() if w.startswith("ava_"))
+    cid = metering.client_for_key(key)
+    assert cid and cid in out
+    assert manage_clients.main(["list"]) == 0
+    listed = capsys.readouterr().out
+    # The key is printed once, when the client is created, and never again.
+    assert cid in listed and "Acme Ltd" in listed and key not in listed
+    assert hashlib.sha256(key.encode()).hexdigest() not in listed
+    assert manage_clients.main(["set-plan", cid, "pro"]) == 0
+    assert {c["client_id"]: c["plan"] for c in metering.list_clients()}[cid] == "pro"
+    with metering.context(client_id=cid):
+        metering.record("groq", "openai/gpt-oss-120b", 1000, 200)
+    assert manage_clients.main(["usage"]) == 0
+    usage_out = capsys.readouterr().out
+    assert cid in usage_out and "1,200" in usage_out
+
+
+def test_cli_rejects_unknown_plan(capsys):
+    assert manage_clients.main(["add", "Acme", "--plan", "gold"]) == 2
+    assert "unknown plan" in capsys.readouterr().err
+    assert [c["client_id"] for c in metering.list_clients()] == ["default"]
+
+
+def test_cli_plans_lists_plan_names(capsys):
+    assert manage_clients.main(["plans"]) == 0
+    out = capsys.readouterr().out
+    assert "starter" in out and "uncapped" in out and "1,000,000" in out
+
+
+def test_cli_set_plan_rejects_unknown_client(capsys):
+    assert manage_clients.main(["set-plan", "nobody-000000", "pro"]) == 2
+    assert "unknown client" in capsys.readouterr().err
+
+
+def test_cli_usage_rejects_a_bad_month(capsys):
+    assert manage_clients.main(["usage", "--month", "2026-13"]) == 2
+    assert "YYYY-MM" in capsys.readouterr().err
+
+
+def test_cli_usage_filters_by_month_and_client(monkeypatch, capsys):
+    acme, _ = metering.add_client("Acme", "starter")
+    beta, _ = metering.add_client("Beta", "free")
+    _record_at(monkeypatch, "2026-09-30T23:59:59.000000Z", "openai/gpt-oss-120b", 300, 30, client_id=beta)
+    _record_at(monkeypatch, "2026-10-01T00:00:00.000000Z", "openai/gpt-oss-120b", 40000, 4000, client_id=beta)
+    _record_at(monkeypatch, "2026-09-15T12:00:00.000000Z", "openai/gpt-oss-120b", 5000, 500, client_id=acme)
+    assert manage_clients.main(["usage", "--month", "2026-09", "--client", beta]) == 0
+    out = capsys.readouterr().out
+    assert "2026-09 (UTC)" in out and beta in out and "330" in out and "100,000" in out
+    assert acme not in out and "44,000" not in out
+
+
+def test_cli_usage_lists_unregistered_and_unpriced_usage(capsys):
+    with metering.context(client_id="ghost"):
+        metering.record("groq", "mystery-model", 70, 7)
+    assert manage_clients.main(["usage"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ghost = next(line for line in lines if line.startswith("ghost"))
+    assert "77" in ghost and "n/a" in ghost and "1 unpriced call" in ghost
+    # No calls at all is an exact $0, not an unpriced n/a.
+    default = next(line for line in lines if line.startswith("default"))
+    assert "uncapped" in default and "$0.0000" in default
+
+
+def test_cli_runs_as_a_script(tmp_path):
+    env = {**os.environ, "METERING_DB": str(tmp_path / "script.db")}
+    done = subprocess.run([sys.executable, manage_clients.__file__, "list"], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    assert "default" in done.stdout
+    assert (tmp_path / "script.db").exists()

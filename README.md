@@ -86,15 +86,65 @@ Lever, Workable, most company career pages) work well; LinkedIn/Indeed/Glassdoor
 often don't — paste the text in those cases. Each fetch call spawns the server
 (~1–3s). If MCP isn't configured, Ava runs exactly as before.
 
+### Usage metering (internal)
+
+Ava records every LLM call in a local SQLite ledger, `backend/data/usage.db`
+(gitignored), so clients can be billed by tokens or sold monthly allowances. Each
+row holds the time, client, chat session, feature (`chat`, `guard`, `interview.*`),
+model, input/output tokens and an estimated cost — **never message text**. Users
+never see usage.
+
+**Clients and keys.** From `backend/`, create a client; its key is printed once
+and stored only as a hash:
+
+```bash
+python manage_clients.py add "Acme Ltd" --plan starter
+python manage_clients.py list
+python manage_clients.py set-plan <client_id> pro
+python manage_clients.py plans
+```
+
+Put the key in `frontend/.env` as `VITE_AVA_CLIENT_KEY=ava_...` and the frontend
+sends it as an `X-Client-Key` header when a chat starts. The key ships in the
+browser bundle, so it identifies the client — it doesn't authenticate users. Chats
+without a key count under the built-in, uncapped `default` client; set
+`REQUIRE_CLIENT_KEY=true` in `backend/.env` to reject them instead.
+
+**Plans.** Monthly token allowances (input + output) live in `backend/plans.json`:
+`internal` and `payg` are uncapped, `free` / `starter` / `pro` have placeholder
+limits, and `suspended` blocks a client without deleting its history. At the limit,
+Ava tells the user their organisation has used this month's allowance and makes no
+model call; a turn that has already started may finish, so a client can go slightly
+over.
+Months are calendar months in **UTC** (they roll over at 05:00 on the 1st in
+Pakistan).
+
+**Cost.** `backend/pricing.json` holds our USD price per 1M tokens for each model.
+Token counts are exact (reported by Groq); cost is an estimate, and a model missing
+from the file is recorded with cost `null` (unpriced), never 0. Restart the backend
+after editing either JSON file.
+
+**Report.** Set `ADMIN_API_KEY` in `backend/.env` to enable
+`GET /api/admin/usage?month=YYYY-MM` (optionally `&client_id=...`) with an
+`X-Admin-Key` header. It returns per-client totals and a breakdown by feature,
+model and day, and stays closed (404) while the key is unset. The same totals from
+the command line:
+
+```bash
+python manage_clients.py usage                       # current month
+python manage_clients.py usage --month 2026-09 --client <client_id>
+```
+
 ## API
 
 | Method | Route | Purpose |
 | ------ | ----- | ------- |
-| POST | `/api/session` | Start a chat; returns a `session_id` and Ava's greeting |
+| POST | `/api/session` | Start a chat; returns a `session_id` and Ava's greeting (optional `X-Client-Key` header) |
 | POST | `/api/upload` | Attach a CV PDF (chunked + embedded for the session) |
 | POST | `/api/message` | Send a message; **streams** Ava's reply (SSE) |
 | GET | `/api/document/{id}` | Download a generated document (`?fmt=pdf` or `?fmt=docx`) |
 | GET | `/api/config` | Which API keys are configured |
+| GET | `/api/admin/usage` | Internal token-usage report for a UTC month (`X-Admin-Key`; `?month=YYYY-MM&client_id=`) |
 
 ## Testing
 

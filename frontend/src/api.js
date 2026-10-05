@@ -2,8 +2,14 @@
 // Override with VITE_API_BASE at build/dev time; defaults to the local backend.
 const BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 
+// Optional client key (VITE_AVA_CLIENT_KEY): ties chats to a client account for
+// internal usage metering. It ships in the browser bundle, so it identifies the
+// tenant — it does not authenticate end users.
+const CLIENT_KEY = import.meta.env.VITE_AVA_CLIENT_KEY;
+
 export async function startSession() {
-  const res = await fetch(BASE + "/session", { method: "POST" });
+  const headers = CLIENT_KEY ? { "X-Client-Key": CLIENT_KEY } : {};
+  const res = await fetch(BASE + "/session", { method: "POST", headers });
   if (!res.ok) throw new Error("Could not start a session");
   return res.json(); // { session_id, greeting }
 }
