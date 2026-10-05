@@ -372,3 +372,165 @@ body {
 .action-cancelled {
   color: var(--muted);
 }
+
+/* ---- Mock interview ---- */
+.iv-card,
+.rp-card {
+  margin-top: 0.75rem;
+  padding: 0.9rem 1rem;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.iv-head,
+.rp-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.iv-title,
+.rp-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.iv-step {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.iv-bar {
+  height: 4px;
+  margin: 0.6rem 0 0.75rem;
+  background: var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.iv-bar span {
+  display: block;
+  height: 100%;
+  background: var(--brand);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.iv-kind {
+  display: inline-block;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--brand);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+}
+.iv-card p.iv-q {
+  margin: 0.55rem 0 0.8rem;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+.iv-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.iv-hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.iv-foot button {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.7rem;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.iv-foot button:hover:not(:disabled) {
+  border-color: var(--brand);
+}
+.iv-foot button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+.iv-foot button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.iv-foot .iv-end {
+  margin-left: auto;
+}
+.rp-score {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.6rem 0 0.2rem;
+}
+.rp-num {
+  font-size: 2.2rem;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.rp-num small {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--muted);
+  margin-left: 0.15rem;
+}
+.rp-band {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.rp-band.strong {
+  color: #6cc28a;
+}
+.rp-band.promising {
+  color: #e0b252;
+}
+.rp-band.needs {
+  color: #e07a7a;
+}
+.rp-card p.rp-meta {
+  margin: 0 0 0.6rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+/* Spacing lives on the wrapper: the h4 is a :first-child, so `.msg.assistant :first-child`
+   would zero its top margin. */
+.rp-list {
+  margin-top: 0.6rem;
+}
+.rp-list h4 {
+  margin: 0 0 0.2rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+.rp-card .rp-list ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+/* (0,2,1) and later in the file, so it beats `.msg.assistant table` (display: block). */
+.rp-card table.rp-table {
+  display: table;
+  margin: 0.75rem 0 0;
+  width: 100%;
+}
+.rp-table td:last-child,
+.rp-table th:last-child {
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.rp-card p.rp-note {
+  margin: 0.7rem 0 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+}

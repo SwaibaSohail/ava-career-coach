@@ -82,6 +82,7 @@ def _guard_tool(tool):
 
 _BUILTIN_TOOL_NAMES = {
     "web_search", "job_search", "search_cv", "save_document", "propose_email",
+    "start_mock_interview",
 }
 _cache: list = []
 

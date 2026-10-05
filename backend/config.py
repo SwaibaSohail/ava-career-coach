@@ -34,6 +34,11 @@ SMTP_FROM = os.getenv("SMTP_FROM", "") or SMTP_USER
 MCP_SERVERS_FILE = os.getenv("MCP_SERVERS_FILE", "mcp_servers.json")
 MCP_MAX_OUTPUT_CHARS = int(os.getenv("MCP_MAX_OUTPUT_CHARS", "4000"))
 
+# Mock interview: how many questions to ask (default from env, clamped to MIN..MAX).
+INTERVIEW_DEFAULT_QUESTIONS = int(os.getenv("INTERVIEW_DEFAULT_QUESTIONS", "5"))
+INTERVIEW_MIN_QUESTIONS = 3
+INTERVIEW_MAX_QUESTIONS = 10
+
 # Local embedding model — runs on-device, no API key or cost.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 

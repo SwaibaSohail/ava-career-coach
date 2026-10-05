@@ -2,6 +2,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import DocumentCard from "./DocumentCard.jsx";
 import ActionCard from "./ActionCard.jsx";
+import InterviewCard from "./InterviewCard.jsx";
+import ReportCard from "./ReportCard.jsx";
 
 const clean = (t) =>
   (t || "")
@@ -9,8 +11,8 @@ const clean = (t) =>
     .replace(/```(?:json)?\s*\{[\s\S]*?\}\s*```/g, "")
     .replace(/<br\s*\/?>/gi, "\n");
 
-export default function Message({ message, streaming, sessionId, smtpConfigured }) {
-  const { role, content, documents, actions } = message;
+export default function Message({ message, streaming, sessionId, smtpConfigured, onSend, active }) {
+  const { role, content, documents, actions, interview, report } = message;
 
   if (role === "system") return <div className="msg system">{content}</div>;
   if (role === "user") return <div className="msg user">{content}</div>;
@@ -42,6 +44,8 @@ export default function Message({ message, streaming, sessionId, smtpConfigured 
           smtpConfigured={smtpConfigured}
         />
       ))}
+      {interview && <InterviewCard q={interview} onSend={onSend} active={active} />}
+      {report && <ReportCard report={report} />}
     </div>
   );
 }

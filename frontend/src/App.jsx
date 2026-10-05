@@ -47,6 +47,8 @@ export default function App() {
         onToken: (t) => patchLast((m) => ({ ...m, content: m.content + t })),
         onDocument: (doc) => patchLast((m) => ({ ...m, documents: [...(m.documents || []), doc] })),
         onAction: (action) => patchLast((m) => ({ ...m, actions: [...(m.actions || []), action] })),
+        onInterview: (q) => patchLast((m) => ({ ...m, interview: q })),
+        onReport: (r) => patchLast((m) => ({ ...m, report: r })),
       });
     } catch {
       patchLast((m) => ({
@@ -73,9 +75,21 @@ export default function App() {
       setBusy(false);
       return;
     }
+    // Mid-interview, every message is scored as an answer — don't send the hidden
+    // upload notice, or it would be graded against the current question.
+    if (interviewActive) {
+      setBusy(false);
+      return;
+    }
     // Let Ava react — she now has the CV in context.
     runAva("I've just uploaded my CV.", false);
   }
+
+  // An interview is running if the latest interview/report card is a question card.
+  // Guardrail blocks, failed evaluations and upload notices carry neither, so they
+  // leave the current question card (and its buttons) live.
+  const lastCard = [...messages].reverse().find((m) => m.interview || m.report);
+  const interviewActive = !!lastCard && !lastCard.report;
 
   return (
     <div className="chat">
@@ -93,6 +107,8 @@ export default function App() {
             streaming={busy && i === messages.length - 1 && m.role === "assistant"}
             sessionId={sessionId}
             smtpConfigured={smtpConfigured}
+            onSend={handleSend}
+            active={!busy && interviewActive && m === lastCard}
           />
         ))}
         <div ref={endRef} />

@@ -9,6 +9,11 @@ Everything happens through a single chat: replies **stream in live**, you attach
 CV with the paperclip, and Ava **asks before adding anything that isn't already in
 your background** — no fabricated skills or dates.
 
+Ava can also run a **mock interview** for a specific job: paste a job description
+(or share a link) and she asks role-specific questions one at a time, scores each
+answer with short feedback, and finishes with a readiness report. Type `skip`,
+`repeat` or `end interview` at any time.
+
 ## Stack
 
 - **Backend:** FastAPI (streaming via Server-Sent Events) · LangChain / LangGraph agent · Groq (LLM)
@@ -27,7 +32,8 @@ grounded in the CV → `save_document` renders a DOCX and PDF you can download.
 React chat  ──HTTP / SSE──▶  FastAPI
                               ├─ session / upload   (RAG: ChromaDB + FastEmbed)
                               ├─ message  ─▶ Ava agent (LangGraph + Groq)
-                              │               tools: job_search, web_search, search_cv, save_document
+                              │               tools: job_search, web_search, search_cv, save_document,
+                              │                      propose_email, start_mock_interview, MCP fetch
                               └─ document ─▶ DOCX / PDF
 ```
 

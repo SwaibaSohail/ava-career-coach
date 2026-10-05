@@ -23,6 +23,7 @@ from cv_processor import load_and_chunk_cv, extract_full_text
 from vector_store import build_cv_vector_store
 from agent import stream_ava, AVA_GREETING
 from guardrails import guard_incoming
+from interview import handle_turn
 from mcp_client import init_mcp
 from schemas import (
     ActionRequest,
@@ -136,21 +137,44 @@ async def upload(session_id: str = Form(...), file: UploadFile = File(...)):
     return UploadResponse(ok=True, filename=file.filename or "cv.pdf", chars=len(session.cv_text))
 
 
+_INTERVIEW_STILL_RUNNING = (
+    "\n\nYour mock interview is still running — answer the current question, or "
+    "type 'skip' or 'end interview'."
+)
+
+
 async def _message_events(session, user_message: str):
     """Yield SSE frames for one turn. Runs the ingress guardrails first; a
     blocked message streams a canned reply and never reaches the agent."""
     # Runs the (possibly LLM-backed) guard off the event loop so it can't block
     # other requests.
     guard = await run_in_threadpool(guard_incoming, user_message)
+    interview = session.interview
+    interview_active = interview is not None and interview.status == "active"
     if not guard.allowed:
-        yield f"data: {json.dumps({'type': 'token', 'text': guard.safe_reply})}\n\n"
+        reply = guard.safe_reply
+        if interview_active:
+            # The canned replies talk about CVs; make clear the interview hasn't moved on.
+            reply += _INTERVIEW_STILL_RUNNING
+        yield f"data: {json.dumps({'type': 'token', 'text': reply})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return
+    if interview_active:
+        # Interview answers bypass the agent: a small focused evaluator handles them.
+        for kind, data in await run_in_threadpool(handle_turn, session, guard.cleaned_message):
+            payload = {"type": kind}
+            if kind == "token":
+                payload["text"] = data
+            else:
+                payload.update(data)
+            yield f"data: {json.dumps(payload)}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
         return
     async for kind, data in stream_ava(session, guard.cleaned_message):
         payload = {"type": kind}
         if kind == "token":
             payload["text"] = data
-        elif kind in ("document", "action"):
+        elif kind in ("document", "action", "interview"):
             payload.update(data)
         yield f"data: {json.dumps(payload)}\n\n"
 
@@ -159,9 +183,17 @@ async def _message_events(session, user_message: str):
 async def message(req: MessageRequest):
     """One conversation turn with Ava, streamed as Server-Sent Events.
 
-    Each line is `data: {json}` where json.type is 'token' (a text delta),
-    'document' (a saved file: id/kind/title), or 'done'. Incoming messages pass
-    the Layer-1 ingress guardrails before reaching the agent.
+    Each line is `data: {json}` where json.type is one of:
+      - 'token'     a text delta (`text`)
+      - 'document'  a saved file: id, kind, title
+      - 'action'    an email awaiting approval: id, kind, to, subject, body, attachments
+      - 'interview' the current mock-interview question: id, role, index, total,
+                    question, kind
+      - 'report'    the final interview report: role, readiness, band, answered,
+                    skipped, total, strengths, improvements, per_question
+      - 'done'      end of the turn
+    Incoming messages pass the Layer-1 ingress guardrails first. While an
+    interview is active, answers go to the interview engine instead of the agent.
     """
     session = _require(req.session_id)
     return StreamingResponse(

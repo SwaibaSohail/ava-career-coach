@@ -21,12 +21,13 @@ export async function uploadCv(sessionId, file) {
 }
 
 // Streams Ava's reply. Calls onToken(text) per delta, onDocument(info) when a
-// file is saved, and onAction(info) when Ava drafts an email awaiting approval.
-// Resolves when the stream closes.
+// file is saved, onAction(info) when Ava drafts an email awaiting approval,
+// onInterview(question) when a mock-interview question is asked, and
+// onReport(report) when the interview ends. Resolves when the stream closes.
 export async function streamMessage(
   sessionId,
   message,
-  { onToken, onDocument = () => {}, onAction = () => {} }
+  { onToken, onDocument = () => {}, onAction = () => {}, onInterview = () => {}, onReport = () => {} }
 ) {
   const res = await fetch(BASE + "/message", {
     method: "POST",
@@ -65,6 +66,27 @@ export async function streamMessage(
           subject: evt.subject,
           body: evt.body,
           attachments: evt.attachments || [],
+        });
+      else if (evt.type === "interview")
+        onInterview({
+          id: evt.id,
+          role: evt.role,
+          index: evt.index,
+          total: evt.total,
+          question: evt.question,
+          kind: evt.kind,
+        });
+      else if (evt.type === "report")
+        onReport({
+          role: evt.role,
+          readiness: evt.readiness,
+          band: evt.band,
+          answered: evt.answered,
+          skipped: evt.skipped,
+          total: evt.total,
+          strengths: evt.strengths || [],
+          improvements: evt.improvements || [],
+          per_question: evt.per_question || [],
         });
     }
   }

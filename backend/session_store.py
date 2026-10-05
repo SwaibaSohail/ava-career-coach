@@ -4,6 +4,7 @@ Each chat session keeps its uploaded CV (text + vector store), Ava's memory
 thread id, and any documents she has generated for download.
 """
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 
@@ -31,6 +32,35 @@ class PendingAction:
 
 
 @dataclass
+class InterviewQuestion:
+    text: str
+    kind: str                 # technical | behavioral | situational | cv_gap
+
+
+@dataclass
+class AnswerResult:
+    question_index: int       # 0-based index into InterviewSession.questions
+    answer: str               # "" when skipped
+    score: int | None         # 1-10; None when skipped
+    feedback: str
+    skipped: bool = False
+
+
+@dataclass
+class InterviewSession:
+    id: str
+    role: str
+    job_summary: str
+    questions: list           # list[InterviewQuestion]
+    results: list = field(default_factory=list)   # list[AnswerResult]
+    current: int = 0          # index of the question currently being asked
+    status: str = "active"    # active | finished
+    report: dict | None = None
+    # Serializes turns, so a double-submitted answer can't be scored against the wrong question.
+    lock: object = field(default_factory=threading.Lock, repr=False, compare=False)
+
+
+@dataclass
 class Session:
     vector_store: object = None
     cv_text: str = ""
@@ -41,6 +71,7 @@ class Session:
     thread_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     documents: dict = field(default_factory=dict)         # id -> Document
     pending_actions: dict = field(default_factory=dict)   # id -> PendingAction
+    interview: InterviewSession | None = None             # set while a mock interview runs
 
 
 _sessions: dict[str, Session] = {}
