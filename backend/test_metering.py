@@ -6,8 +6,14 @@ import sqlite3
 
 import pytest
 from fastapi.concurrency import run_in_threadpool
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
+from pydantic import BaseModel
 
 import config
+import guardrails
+import interview
+import llm
 import metering
 
 
@@ -302,3 +308,125 @@ def test_usage_report_includes_usage_from_unregistered_clients(monkeypatch):
 def test_usage_report_rejects_bad_month():
     with pytest.raises(ValueError):
         metering.usage_report("2026-13")
+
+
+# --- Recorder -------------------------------------------------------------
+
+def _streamed_result(inp=40, out=9):
+    # Shape ChatGroq produces for a streamed call: aggregated chunk with usage, no llm_output.
+    msg = AIMessageChunk(content="hi", usage_metadata={"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out})
+    return LLMResult(generations=[[ChatGenerationChunk(message=msg)]], llm_output=None)
+
+
+def test_recorder_records_streamed_usage():
+    with metering.context(client_id="acme", feature="chat"):
+        metering.UsageRecorder("groq", "openai/gpt-oss-120b").on_llm_end(_streamed_result())
+    (row,) = _rows()
+    assert row["input_tokens"] == 40 and row["output_tokens"] == 9 and row["client_id"] == "acme"
+
+
+def test_recorder_falls_back_to_llm_output_token_usage():
+    result = LLMResult(generations=[[ChatGeneration(message=AIMessage(content="x"))]],
+                       llm_output={"token_usage": {"prompt_tokens": 7, "completion_tokens": 3}})
+    metering.UsageRecorder("groq", "m").on_llm_end(result)
+    assert (_rows()[0]["input_tokens"], _rows()[0]["output_tokens"]) == (7, 3)
+
+
+def test_recorder_skips_reply_without_usage(caplog):
+    result = LLMResult(generations=[[ChatGeneration(message=AIMessage(content="x"))]], llm_output=None)
+    metering.UsageRecorder("groq", "m").on_llm_end(result)
+    assert _rows() == [] and "no token usage" in caplog.text
+
+
+def test_recorder_swallows_ledger_errors(monkeypatch):
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(metering, "record", boom)
+    metering.UsageRecorder("groq", "m").on_llm_end(_streamed_result())  # must not raise
+
+
+# --- Model calls (a real ChatGroq with a fake HTTP client) ----------------
+
+def test_get_llm_attaches_exactly_one_recorder(groq_llm):
+    model = groq_llm()
+    assert sum(isinstance(cb, metering.UsageRecorder) for cb in model.callbacks) == 1
+
+
+def test_one_invoke_writes_exactly_one_row(groq_llm, monkeypatch):
+    monkeypatch.setattr(config, "GROQ_MODEL", "openai/gpt-oss-120b")
+    groq_llm(prompt_tokens=30, completion_tokens=4).invoke("hello")
+    (row,) = _rows()
+    assert (row["input_tokens"], row["output_tokens"], row["model"]) == (30, 4, "openai/gpt-oss-120b")
+    assert row["cost_usd"] is not None
+
+
+def test_async_invoke_is_recorded_once(groq_llm):
+    asyncio.run(groq_llm(prompt_tokens=15, completion_tokens=3).ainvoke("hello"))
+    (row,) = _rows()
+    assert (row["input_tokens"], row["output_tokens"]) == (15, 3)
+
+
+def test_json_schema_structured_output_is_recorded_once(groq_llm):
+    class Out(BaseModel):
+        score: int
+    model = groq_llm(content='{"score": 7}', prompt_tokens=50, completion_tokens=6)
+    assert model.with_structured_output(Out, method="json_schema").invoke("rate it").score == 7
+    (row,) = _rows()
+    assert (row["input_tokens"], row["output_tokens"]) == (50, 6)
+
+
+def test_streamed_call_is_recorded_once(groq_llm):
+    assert "".join(c.content for c in groq_llm(content="streamed", prompt_tokens=20, completion_tokens=2).stream("hi")) == "streamed"
+    (row,) = _rows()
+    assert (row["input_tokens"], row["output_tokens"]) == (20, 2)
+
+
+def test_agent_turn_records_under_client_and_chat_feature(groq_llm):
+    from langchain.agents import create_agent
+
+    model = groq_llm(content="Hello!", prompt_tokens=80, completion_tokens=3)
+    agent = create_agent(model=model, tools=[], system_prompt="Be brief.")
+
+    async def go():
+        with metering.context(client_id="acme", session_id="s1", feature="chat"):
+            async for _ in agent.astream({"messages": [("user", "hi")]}, stream_mode="messages"):
+                pass
+    asyncio.run(go())
+    # Streamed like main.py's agent turns, so usage came from the final x_groq chunk.
+    assert [c.get("stream") for c in model.async_client.calls] == [True]
+    (row,) = _rows()
+    assert (row["client_id"], row["session_id"], row["feature"]) == ("acme", "s1", "chat")
+    assert (row["input_tokens"], row["output_tokens"]) == (80, 3)
+
+
+# --- Feature tags ---------------------------------------------------------
+
+def test_guard_call_is_tagged_guard(groq_llm, monkeypatch):
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: groq_llm(content="CLEAN", **kw))
+    with metering.context(client_id="acme", feature="chat"):
+        assert guardrails.check_input_llm("How do I improve my CV?") == "CLEAN"
+        assert metering.current()["feature"] == "chat"
+    (row,) = _rows()
+    assert (row["client_id"], row["feature"], row["model"]) == ("acme", "guard", config.GUARD_MODEL)
+
+
+def test_interview_calls_are_tagged_by_step(groq_llm, monkeypatch):
+    replies = iter([
+        '{"role": "Python Developer", "job_summary": "Builds APIs.",'
+        ' "questions": [{"text": "Tell me about an API you built.", "kind": "technical"}]}',
+        '{"score": 7, "feedback": "Clear; add numbers."}',
+        '{"strengths": ["Clear structure"], "improvements": ["Quantify impact"]}',
+    ])
+    monkeypatch.setattr(interview, "get_llm", lambda **kw: groq_llm(content=next(replies), **kw))
+    with metering.context(client_id="acme", feature="chat"):
+        qset = interview._generate_question_set("Senior Python role.", "", 1)
+        ev = interview._evaluate_answer(qset.role, qset.job_summary, qset.questions[0].text, "I built one.")
+        narrative = interview._report_narrative(
+            qset.role, [{"question": qset.questions[0].text, "score": ev.score, "feedback": ev.feedback}])
+        assert metering.current()["feature"] == "chat"
+    assert qset.questions[0].kind == "technical" and ev.score == 7
+    assert narrative.strengths == ["Clear structure"]
+    assert [(r["client_id"], r["feature"]) for r in _rows()] == [
+        ("acme", "interview.questions"), ("acme", "interview.score"), ("acme", "interview.report"),
+    ]

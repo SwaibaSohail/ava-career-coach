@@ -3,8 +3,8 @@
 Questions are generated once from the job description (and CV, if uploaded);
 each answer is then scored by a small, focused model call. Interview turns
 bypass the main agent entirely, so an answer costs only: role + job summary +
-current question + answer. Every model call goes through llm.get_llm, so future
-token metering hooks in at one place.
+current question + answer. Every model call goes through llm.get_llm, which
+records its token usage; each call here is tagged with its own metering feature.
 """
 
 import logging
@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 import config
+import metering
 from cv_processor import sanitize_cv_text
 from llm import get_llm
 from session_store import AnswerResult, InterviewQuestion, InterviewSession
@@ -107,7 +108,8 @@ def _generate_question_set(job_description: str, cv_text: str, n: int) -> Questi
         "warm-up to hardest. Also give the role title and a short job summary."
     )
     model = _structured(QuestionSet, temperature=0.4)
-    return model.invoke(prompt)
+    with metering.feature("interview.questions"):
+        return model.invoke(prompt)
 
 
 def start_interview(session, job_description: str, num_questions: int | None = None) -> InterviewSession:
@@ -206,7 +208,8 @@ def _evaluate_answer(role: str, job_summary: str, question: str, answer: str) ->
         "feedback: what worked and the single most useful improvement."
     )
     model = _structured(Evaluation, temperature=0.2)
-    return model.invoke(prompt)
+    with metering.feature("interview.score"):
+        return model.invoke(prompt)
 
 
 def _report_narrative(role: str, items: list[dict]) -> Narrative:
@@ -221,7 +224,8 @@ def _report_narrative(role: str, items: list[dict]) -> Narrative:
         "List 2-3 strengths and 2-3 specific improvements, each a short phrase."
     )
     model = _structured(Narrative, temperature=0.3)
-    return model.invoke(prompt)
+    with metering.feature("interview.report"):
+        return model.invoke(prompt)
 
 
 def _band(readiness: int) -> str:

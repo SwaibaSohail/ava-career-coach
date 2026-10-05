@@ -186,13 +186,15 @@ def check_input_llm(message: str) -> str:
     if not config.GUARD_LLM_ENABLED:
         return "CLEAN"
     try:
+        import metering
         from llm import get_llm
         from langchain_core.messages import HumanMessage, SystemMessage
 
         llm = get_llm(temperature=0, model=config.GUARD_MODEL)
-        resp = llm.invoke(
-            [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
-        )
+        with metering.feature("guard"):
+            resp = llm.invoke(
+                [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
+            )
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         upper = content.upper()
         for label in ("INJECTION", "ABUSE", "HARMFUL"):
