@@ -109,16 +109,19 @@ Put the key in `frontend/.env` as `VITE_AVA_CLIENT_KEY=ava_...` and the frontend
 sends it as an `X-Client-Key` header when a chat starts. The key ships in the
 browser bundle, so it identifies the client — it doesn't authenticate users. Chats
 without a key count under the built-in, uncapped `default` client; set
-`REQUIRE_CLIENT_KEY=true` in `backend/.env` to reject them instead.
+`REQUIRE_CLIENT_KEY=true` in `backend/.env` to reject them instead. With keys
+required, a chat can't start while the ledger can't be read (the session request
+gets a 503 and can be retried); without, it starts under `default` and the error
+is logged.
 
 **Plans.** Monthly token allowances (input + output) live in `backend/plans.json`:
 `internal` and `payg` are uncapped, `free` / `starter` / `pro` have placeholder
-limits, and `suspended` blocks a client without deleting its history. At the limit,
-Ava tells the user their organisation has used this month's allowance and makes no
-model call; a turn that has already started may finish, so a client can go slightly
-over. Each turn in flight holds a share of what's left (`TURN_TOKEN_RESERVE`, 20,000
-tokens by default), so a burst of parallel chats can't all start on the last few
-tokens; near the limit, the extra chats are asked to try again in a moment.
+limits, and `suspended` blocks a client without deleting its history. The allowance
+is checked once per message, before any model call. At the limit, Ava tells the
+user their organisation has used this month's allowance and makes no model call. A
+message that has passed the check is allowed to finish, so a client can go slightly
+over: one long reply can cross the limit, and several chats sent at the same moment
+near the limit can each pass the check and each finish.
 Months are calendar months in **UTC** (they roll over at 05:00 on the 1st in
 Pakistan).
 
@@ -127,11 +130,20 @@ Token counts are exact (reported by Groq); cost is an estimate, and a model miss
 from the file is recorded with cost `null` (unpriced), never 0. Restart the backend
 after editing either JSON file.
 
+**Cut-off replies.** If a model call is cut off mid-reply (usually because the user
+closed the chat), Groq still bills what it generated, but its token count, which
+comes at the end of the reply, never arrives. Such a call is recorded with
+`estimated = 1`: input tokens from the prompt's length, output tokens from the text
+streamed so far, at about 4 characters per token. A request that fails outright (an
+HTTP error or rate limit) isn't billed by Groq and isn't recorded. Older ledgers
+gain the `estimated` column automatically.
+
 **Report.** Set `ADMIN_API_KEY` in `backend/.env` to enable
 `GET /api/admin/usage?month=YYYY-MM` (optionally `&client_id=...`) with an
 `X-Admin-Key` header. It returns per-client totals and a breakdown by feature,
-model and day, and stays closed (404) while the key is unset. The same totals from
-the command line:
+model and day, each with `estimated_calls` (cut-off replies). It stays closed while
+the key is unset: every method gets a 404, as for a page that doesn't exist. The
+same totals from the command line, which also flags estimated and unpriced calls:
 
 ```bash
 python manage_clients.py usage                       # current month

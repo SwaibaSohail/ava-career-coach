@@ -24,6 +24,13 @@ def _fmt_cost(client):
     return "n/a" if client["cost_usd"] is None else f"${client['cost_usd']:.4f}"
 
 
+def _fmt_calls(client):
+    # Calls without a price, and replies cut off mid-stream whose tokens are estimates.
+    notes = [f"{n} {kind} call{'s' if n != 1 else ''}"
+             for kind, n in (("unpriced", client["unpriced_calls"]), ("estimated", client["estimated_calls"])) if n]
+    return f" ({', '.join(notes)})" if notes else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="manage_clients.py", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -59,11 +66,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Usage for {report['month']} (UTC)")
             for c in report["clients"]:
                 # Usage under a client id with no account row has no plan.
-                n = c["unpriced_calls"]
                 print(f"{c['client_id']:<32} {c['plan'] or '(none)':<10} "
                       f"{c['used_tokens']:>12,} / {_fmt_limit(c['monthly_tokens']):<12} "
-                      f"est. cost {_fmt_cost(c)}"
-                      + (f" ({n} unpriced call{'s' if n != 1 else ''})" if n else ""))
+                      f"est. cost {_fmt_cost(c)}{_fmt_calls(c)}")
             if not report["clients"]:
                 print("No matching clients.")
             print(report["note"])

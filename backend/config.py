@@ -52,11 +52,6 @@ METERING_DB = os.getenv("METERING_DB", "data/usage.db")
 PLANS_FILE = "plans.json"
 PRICING_FILE = "pricing.json"
 
-# Tokens a capped client's chat turn holds against its allowance while it runs,
-# so a burst of parallel turns can't all start on the same "used" figure (usage
-# is only written as each model call ends). Roughly one agent turn.
-TURN_TOKEN_RESERVE = int(os.getenv("TURN_TOKEN_RESERVE", "20000"))
-
 # Admin usage report (GET /api/admin/usage): closed (404) unless this is set.
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 

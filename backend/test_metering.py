@@ -3,15 +3,20 @@ import contextvars
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
 import sys
+import uuid
 
+import anyio
+import groq
+import httpx
 import pytest
 from fastapi.concurrency import run_in_threadpool
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from pydantic import BaseModel
 
@@ -24,6 +29,7 @@ import metering
 
 
 def _rows():
+    metering.flush()  # rows from model calls reach the ledger through a writer thread
     conn = sqlite3.connect(config.METERING_DB)
     conn.row_factory = sqlite3.Row
     try:
@@ -57,6 +63,7 @@ def test_record_uses_context_and_defaults():
     assert (second["client_id"], second["session_id"], second["feature"]) == ("acme", metering.session_ref("s1"), "chat")
     assert second["total_tokens"] == 15 and second["provider"] == "groq"
     assert first["ts_utc"].endswith("Z")
+    assert first["estimated"] == second["estimated"] == 0
 
 
 def test_ledger_stores_no_message_text():
@@ -64,8 +71,34 @@ def test_ledger_stores_no_message_text():
         metering.record("groq", "openai/gpt-oss-120b", 10, 5)
     assert set(_rows()[0]) == {
         "id", "ts_utc", "client_id", "session_id", "feature", "provider", "model",
-        "input_tokens", "output_tokens", "total_tokens", "cost_usd",
+        "input_tokens", "output_tokens", "total_tokens", "cost_usd", "estimated",
     }
+
+
+def test_ledger_from_before_estimates_is_upgraded_in_place(monkeypatch):
+    # A ledger written by an earlier version has no `estimated` column. It is
+    # added on first use, its rows count as exact, and nothing is lost.
+    old = sqlite3.connect(config.METERING_DB)
+    old.executescript("""
+        CREATE TABLE clients (client_id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL,
+                              key_hash TEXT UNIQUE, created_utc TEXT NOT NULL);
+        CREATE TABLE usage (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL,
+                            client_id TEXT NOT NULL, session_id TEXT, feature TEXT NOT NULL,
+                            provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL,
+                            output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, cost_usd REAL);
+        INSERT INTO clients VALUES ('acme-123456', 'Acme', 'free', 'somehash', '2026-10-01T00:00:00.000000Z');
+        INSERT INTO usage (ts_utc, client_id, session_id, feature, provider, model, input_tokens,
+                           output_tokens, total_tokens, cost_usd)
+        VALUES ('2026-10-06T09:00:00.000000Z', 'acme-123456', NULL, 'chat', 'groq',
+                'openai/gpt-oss-120b', 100, 20, 120, 0.000027);
+    """)
+    old.close()
+    _record_at(monkeypatch, "2026-10-06T10:00:00.000000Z", "openai/gpt-oss-120b", 10, 5,
+               client_id="acme-123456")
+    metering.record("groq", "openai/gpt-oss-120b", 1, 1, estimated=True)
+    assert [(r["total_tokens"], r["estimated"]) for r in _rows()] == [(120, 0), (15, 0), (2, 1)]
+    (acme,) = [c for c in metering.usage_report("2026-10")["clients"] if c["client_id"] == "acme-123456"]
+    assert acme["used_tokens"] == 135 and acme["estimated_calls"] == 0
 
 
 def test_feature_overrides_only_feature_and_resets():
@@ -260,39 +293,6 @@ def test_client_on_unknown_plan_is_allowed_with_warning(monkeypatch, caplog):
     assert "unknown plan" in caplog.text
 
 
-def test_turn_holds_a_share_until_released():
-    client_id, _ = metering.add_client("Acme", "free")
-    _record_for(client_id, 99_000)
-    first = metering.check_allowance(client_id, reserve=True)
-    assert first.allowed and first.reserved > 0
-    assert metering.check_allowance(client_id, reserve=True) == metering.Allowance(False, 99_000, 100_000)
-    # A plain check (reports, tests) neither holds nor counts holds.
-    assert metering.check_allowance(client_id) == metering.Allowance(True, 99_000, 100_000)
-    metering.release(client_id, first)
-    again = metering.check_allowance(client_id, reserve=True)
-    assert again.allowed
-    metering.release(client_id, again)
-
-
-def test_allowance_check_rereads_when_a_turn_ends_during_it(monkeypatch):
-    client_id, _ = metering.add_client("Acme", "free")
-    _record_for(client_id, 99_000)
-    first = metering.check_allowance(client_id, reserve=True)
-    real, reads = metering._usage_and_limit, []
-
-    def turn_ends_mid_read(cid):
-        result = real(cid)
-        if not reads:
-            # The running turn writes its last usage and ends just after our read.
-            _record_for(client_id, 15_000)
-            metering.release(client_id, first)
-        reads.append(result)
-        return result
-    monkeypatch.setattr(metering, "_usage_and_limit", turn_ends_mid_read)
-    assert metering.check_allowance(client_id, reserve=True) == metering.Allowance(False, 114_000, 100_000)
-    assert len(reads) == 2
-
-
 def test_allowance_check_fails_open(monkeypatch, caplog):
     def boom():
         raise sqlite3.OperationalError("database is locked")
@@ -378,6 +378,21 @@ def test_usage_report_rejects_bad_month():
         metering.usage_report("2026-13")
 
 
+def test_usage_report_counts_estimated_calls(monkeypatch):
+    acme, _ = metering.add_client("Acme", "starter")
+    _record_at(monkeypatch, "2026-10-06T09:00:00.000000Z", "openai/gpt-oss-120b", 100, 10,
+               client_id=acme, feature="chat")
+    with metering.context(client_id=acme, feature="chat"):
+        for _ in range(2):
+            metering.record("groq", "openai/gpt-oss-120b", 40, 6, estimated=True)
+    report = metering.usage_report("2026-10")
+    (row,) = [r for r in report["breakdown"] if r["client_id"] == acme]
+    assert (row["calls"], row["estimated_calls"], row["total_tokens"]) == (3, 2, 202)
+    clients = {c["client_id"]: c for c in report["clients"]}
+    assert clients[acme]["estimated_calls"] == 2 and clients["default"]["estimated_calls"] == 0
+    assert "cut off" in report["note"] and "estimated=1" in report["note"]
+
+
 # --- Recorder -------------------------------------------------------------
 
 def _streamed_result(inp=40, out=9):
@@ -411,6 +426,62 @@ def test_recorder_swallows_ledger_errors(monkeypatch):
         raise sqlite3.OperationalError("disk I/O error")
     monkeypatch.setattr(metering, "record", boom)
     metering.UsageRecorder("groq", "m").on_llm_end(_streamed_result())  # must not raise
+    metering.flush()  # nor the writer thread: the failure is only logged
+
+
+def _chunk(text="", **message):
+    return ChatGenerationChunk(message=AIMessageChunk(content=text, **message))
+
+
+def _open_call(recorder):
+    """Start a call on the recorder and stream part of a reply, as LangChain would."""
+    run_id = uuid.uuid4()
+    recorder.on_chat_model_start({}, [[HumanMessage("Tailor my CV for a data role")]], run_id=run_id)
+    recorder.on_llm_new_token("Sure, ", chunk=_chunk("Sure, "), run_id=run_id)
+    # Reasoning and tool-call arguments are output Groq bills too.
+    recorder.on_llm_new_token("", chunk=_chunk(additional_kwargs={"reasoning_content": "Check the CV. "}),
+                              run_id=run_id)
+    recorder.on_llm_new_token("", chunk=_chunk(tool_call_chunks=[
+        {"name": "search_cv", "args": '{"query": "data"}', "id": "c1", "index": 0}]), run_id=run_id)
+    return run_id
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), GeneratorExit()], ids=["cancelled", "closed"])
+def test_recorder_estimates_a_call_cut_off_mid_reply(error):
+    recorder = metering.UsageRecorder("groq", "openai/gpt-oss-120b")
+    with metering.context(client_id="acme", session_id="s1", feature="chat"):
+        run_id = _open_call(recorder)
+    # Attribution is read when the call starts, not where the error lands.
+    recorder.on_llm_error(error, run_id=run_id)
+    (row,) = _rows()
+    assert (row["client_id"], row["session_id"], row["feature"]) == ("acme", metering.session_ref("s1"), "chat")
+    assert row["estimated"] == 1 and row["cost_usd"] is not None
+    # About four characters a token, rounded up.
+    assert row["input_tokens"] == math.ceil(len("Human: Tailor my CV for a data role") / 4)
+    assert row["output_tokens"] == math.ceil(len('Sure, Check the CV. {"query": "data"}') / 4)
+    assert recorder._calls == {}
+
+
+def test_recorder_uses_exact_usage_if_it_arrived_before_the_cut():
+    recorder = metering.UsageRecorder("groq", "openai/gpt-oss-120b")
+    run_id = _open_call(recorder)
+    recorder.on_llm_new_token("", chunk=_chunk(usage_metadata={"input_tokens": 300, "output_tokens": 25,
+                                                               "total_tokens": 325}), run_id=run_id)
+    recorder.on_llm_error(asyncio.CancelledError(), run_id=run_id)
+    (row,) = _rows()
+    assert (row["input_tokens"], row["output_tokens"], row["estimated"]) == (300, 25, 0)
+
+
+def _rate_limited():
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    return groq.RateLimitError("Rate limit reached", response=httpx.Response(429, request=request), body=None)
+
+
+def test_recorder_records_nothing_for_a_failed_call():
+    # Groq doesn't bill a request that fails (rate limit, 5xx), even part-way through.
+    recorder = metering.UsageRecorder("groq", "openai/gpt-oss-120b")
+    recorder.on_llm_error(_rate_limited(), run_id=_open_call(recorder))
+    assert _rows() == [] and recorder._calls == {}
 
 
 # --- Model calls (a real ChatGroq with a fake HTTP client) ----------------
@@ -425,7 +496,7 @@ def test_one_invoke_writes_exactly_one_row(groq_llm, monkeypatch):
     groq_llm(prompt_tokens=30, completion_tokens=4).invoke("hello")
     (row,) = _rows()
     assert (row["input_tokens"], row["output_tokens"], row["model"]) == (30, 4, "openai/gpt-oss-120b")
-    assert row["cost_usd"] is not None
+    assert row["cost_usd"] is not None and row["estimated"] == 0
 
 
 def test_async_invoke_is_recorded_once(groq_llm):
@@ -444,18 +515,51 @@ def test_json_schema_structured_output_is_recorded_once(groq_llm):
 
 
 def test_streamed_call_is_recorded_once(groq_llm):
-    assert "".join(c.content for c in groq_llm(content="streamed", prompt_tokens=20, completion_tokens=2).stream("hi")) == "streamed"
+    model = groq_llm(content=["str", "eam", "ed"], prompt_tokens=20, completion_tokens=2)
+    assert "".join(c.content for c in model.stream("hi")) == "streamed"
     (row,) = _rows()
-    assert (row["input_tokens"], row["output_tokens"]) == (20, 2)
+    assert (row["input_tokens"], row["output_tokens"], row["estimated"]) == (20, 2, 0)
+    assert model.callbacks[0]._calls == {}
+
+
+def test_stream_closed_early_is_recorded_as_an_estimate(groq_llm):
+    # The caller stops reading: LangChain reports GeneratorExit through on_llm_error.
+    model = groq_llm(content=["Hello ", "there"], prompt_tokens=20, completion_tokens=2)
+    stream = model.stream("hi")
+    assert next(stream).content == "Hello "
+    stream.close()
+    (row,) = _rows()
+    assert (row["output_tokens"], row["estimated"]) == (math.ceil(len("Hello ") / 4), 1)
+    assert 0 < row["input_tokens"] < 20
+
+
+def test_async_stream_cancelled_in_a_cancel_scope_is_recorded_as_an_estimate(groq_llm):
+    # anyio cancellation is level-triggered, as Starlette delivers it: every
+    # await on the way out is cancelled again, including LangChain's await on
+    # its own error callback. The row must be written anyway.
+    model = groq_llm(content=["Hello ", "there, ", "I can ", "help"], prompt_tokens=60, completion_tokens=4)
+    model.async_client.before_usage = asyncio.Event().wait  # the rest of the reply never comes
+
+    async def go():
+        with metering.context(client_id="acme", feature="chat"):
+            with anyio.CancelScope() as scope:
+                async for _ in model.astream("Hi Ava"):
+                    scope.cancel()
+    anyio.run(go)
+    (row,) = _rows()
+    assert (row["client_id"], row["feature"], row["estimated"]) == ("acme", "chat", 1)
+    assert row["output_tokens"] == math.ceil(len("Hello there, I can help") / 4)
+    assert model.callbacks[0]._calls == {}
 
 
 def test_locked_ledger_does_not_freeze_the_event_loop(groq_llm):
     # Another writer (e.g. a DB browser with an unsaved edit) holds the ledger's
-    # write lock. Recording must wait for it off the event loop, so other chats
-    # keep streaming and the holder can finish; inline, the loop would freeze for
-    # the whole busy timeout and the row would be lost.
+    # write lock. Recording must wait for it off the event loop (in the writer
+    # thread), so other chats keep streaming and the holder can finish; on the
+    # loop, it would freeze for the whole busy timeout and the row would be lost.
     model = groq_llm(prompt_tokens=15, completion_tokens=3)
     asyncio.run(model.ainvoke("warm up"))  # one-off client setup, before the clock starts
+    metering.flush()  # and the ledger exists, as it does once a turn has checked its allowance
     holder = sqlite3.connect(config.METERING_DB, isolation_level=None)
     holder.execute("BEGIN IMMEDIATE")
 
@@ -502,7 +606,7 @@ def test_agent_turn_records_under_client_and_chat_feature(groq_llm):
     assert [c.get("stream") for c in model.async_client.calls] == [True]
     (row,) = _rows()
     assert (row["client_id"], row["session_id"], row["feature"]) == ("acme", metering.session_ref("s1"), "chat")
-    assert (row["input_tokens"], row["output_tokens"]) == (80, 3)
+    assert (row["input_tokens"], row["output_tokens"], row["estimated"]) == (80, 3, 0)
 
 
 # --- Feature tags ---------------------------------------------------------
@@ -607,6 +711,21 @@ def test_client_key_lookup_fails_open(api, monkeypatch, caplog):
     assert "key lookup failed" in caplog.text
 
 
+def test_client_key_lookup_failure_is_503_when_keys_are_required(api, monkeypatch):
+    # With keys required, a chat must never land on the uncapped default client
+    # just because the ledger couldn't be read.
+    import session_store
+    monkeypatch.setattr(config, "REQUIRE_CLIENT_KEY", True)
+
+    def boom(key):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(metering, "client_for_key", boom)
+    res = api.post("/api/session", headers={"X-Client-Key": "ava_anything"})
+    assert res.status_code == 503
+    assert res.json()["detail"] == "Usage service unavailable, please try again shortly."
+    assert session_store._sessions == {}
+
+
 def test_over_limit_streams_notice_without_calling_a_model(api, monkeypatch):
     import main
     _, key = metering.add_client("Acme", "suspended")
@@ -639,10 +758,10 @@ async def _turn_frames(session, text):
     return [json.loads(f[len("data: "):]) async for f in main._message_events(session, text)]
 
 
-def test_parallel_turns_cannot_all_pass_one_allowance_check(monkeypatch):
-    # Usage is only written as each model call ends, so a burst of turns would
-    # all see the same "used" figure and a capped client could blow far past
-    # its limit in one go.
+def test_parallel_turns_started_together_may_all_finish(monkeypatch):
+    # One check per turn, before any model call, and a turn that has started may
+    # finish: turns that pass the check together can each run to the end and
+    # take a client slightly over its allowance. The next turn is then refused.
     import main
     import session_store
     cid, _ = metering.add_client("Acme", "free")
@@ -651,70 +770,21 @@ def test_parallel_turns_cannot_all_pass_one_allowance_check(monkeypatch):
     monkeypatch.setattr(main, "guard_incoming", _allow_all)
     started = []
 
-    async def tool_using_turn(session, message):
+    async def turn(session, message):
         started.append(session.id)
-        for _ in range(3):
+        while len(started) < len(sessions):  # all three are past the check
             await asyncio.sleep(0.01)
-            metering.record("groq", "openai/gpt-oss-120b", 5_000, 0)
+        metering.record("groq", "openai/gpt-oss-120b", 5_000, 0)
         yield ("token", "Done.")
         yield ("done", None)
-    monkeypatch.setattr(main, "stream_ava", tool_using_turn)
+    monkeypatch.setattr(main, "stream_ava", turn)
 
     async def burst():
-        return await asyncio.gather(*(_turn_frames(sessions[i % 3], "Find me jobs") for i in range(30)))
-    replies = [_reply(frames) for frames in asyncio.run(burst())]
-    assert len(started) == 1 and replies.count("Done.") == 1
-    # Told to wait while that turn runs, or that the allowance is gone once it's done.
-    assert all("allowance" in r for r in replies if r != "Done.")
+        turns = asyncio.gather(*(_turn_frames(s, "Find me jobs") for s in sessions))
+        return await asyncio.wait_for(turns, 5)
+    assert [_reply(frames) for frames in asyncio.run(burst())] == ["Done."] * 3
     assert metering.check_allowance(cid).used == 99_000 + 15_000
-
-
-def test_a_finished_or_abandoned_turn_frees_the_allowance_it_held(monkeypatch):
-    import main
-    import session_store
-    cid, _ = metering.add_client("Acme", "free")
-    _record_for(cid, 99_000)
-    session = session_store.Session(id="s1", client_id=cid)
-    monkeypatch.setattr(main, "guard_incoming", _allow_all)
-    calls = []
-
-    async def turn(session, message):
-        calls.append(message)
-        yield ("token", f"Reply {len(calls)}.")
-        if len(calls) == 1:
-            await asyncio.Event().wait()  # stalls until the user closes the tab
-        yield ("done", None)
-    monkeypatch.setattr(main, "stream_ava", turn)
-
-    async def go():
-        first = main._message_events(session, "one")
-        assert "Reply 1." in await first.__anext__()
-        while_running = _reply(await _turn_frames(session, "two"))
-        await first.aclose()
-        after_leaving = _reply(await _turn_frames(session, "three"))
-        after_finishing = _reply(await _turn_frames(session, "four"))
-        return while_running, after_leaving, after_finishing
-    while_running, after_leaving, after_finishing = asyncio.run(go())
-    assert "try again" in while_running and calls[1:] == ["three", "four"]
-    assert (after_leaving, after_finishing) == ("Reply 2.", "Reply 3.")
-
-
-def test_uncapped_clients_run_turns_in_parallel(monkeypatch):
-    import main
-    import session_store
-    _record_for(metering.DEFAULT_CLIENT, 10_000_000)
-    session = session_store.Session(id="s1")
-    monkeypatch.setattr(main, "guard_incoming", _allow_all)
-
-    async def turn(session, message):
-        await asyncio.sleep(0.01)
-        yield ("token", "Done.")
-        yield ("done", None)
-    monkeypatch.setattr(main, "stream_ava", turn)
-
-    async def burst():
-        return await asyncio.gather(*(_turn_frames(session, "hi") for _ in range(10)))
-    assert [_reply(frames) for frames in asyncio.run(burst())] == ["Done."] * 10
+    assert "allowance" in _reply(asyncio.run(_turn_frames(sessions[0], "One more")))
 
 
 def test_over_limit_also_gates_interview_turns(api, monkeypatch):
@@ -786,8 +856,106 @@ def test_chat_turn_is_billed_to_the_session_client(api, fake_ava):
     assert "Hello from Ava" in _reply(frames) and frames[-1]["type"] == "done"
     (row,) = _rows()
     assert (row["client_id"], row["session_id"], row["feature"]) == (cid, metering.session_ref(sid), "chat")
-    assert (row["input_tokens"], row["output_tokens"]) == (60, 4)
+    assert (row["input_tokens"], row["output_tokens"], row["estimated"]) == (60, 4, 0)
     assert metering.check_allowance(cid).used == 64
+
+
+def _agent_on(monkeypatch, model):
+    """Ava's turns run the real agent loop on this (faked) model."""
+    import agent
+    from langchain.agents import create_agent
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", False)
+    monkeypatch.setattr(agent, "_build_ava", lambda session: create_agent(model=model, tools=[], system_prompt="x"))
+
+
+def test_reply_cut_off_mid_stream_is_recorded_as_an_estimate(groq_llm, monkeypatch):
+    # The user closes the tab while Ava is still replying. Starlette cancels the
+    # response (an anyio cancel scope) while it waits to send, then the reply
+    # it abandoned is closed, which cancels the model call still streaming.
+    # LangChain reports nothing for that call, but Groq bills what it generated.
+    import main
+    import session_store
+    model = groq_llm(content=["Hello ", "there, ", "I can ", "help"], prompt_tokens=60, completion_tokens=4)
+    model.async_client.before_usage = asyncio.Event().wait  # the rest of the reply never comes
+    _agent_on(monkeypatch, model)
+    cid, _ = metering.add_client("Acme", "starter")
+    session = session_store.Session(id="s1", client_id=cid)
+
+    async def go():
+        turn = main._message_events(session, "Hi Ava")
+        with anyio.CancelScope() as scope:
+            async for frame in turn:
+                if '"token"' in frame:
+                    scope.cancel()
+                    await anyio.sleep(5)  # Starlette's `await send(...)`, cancelled
+        await turn.aclose()
+        for _ in range(100):  # the cut-off call is recorded as its task unwinds
+            if rows := _rows():
+                return rows
+            await asyncio.sleep(0.02)
+        return []
+    (row,) = anyio.run(go)
+    assert (row["client_id"], row["session_id"], row["feature"]) == (cid, metering.session_ref("s1"), "chat")
+    assert row["estimated"] == 1
+    assert row["output_tokens"] == math.ceil(len("Hello there, I can help") / 4)
+    assert 0 < row["input_tokens"] < 20
+    assert metering.check_allowance(cid).used == row["total_tokens"]
+    assert model.callbacks[0]._calls == {}
+
+
+def test_reply_still_generating_when_the_user_leaves_is_billed(groq_llm, monkeypatch):
+    # Starlette's own disconnect path, through the real app. Here the model
+    # call is left to finish in the background, so its count is exact.
+    import main
+    import session_store
+    model = groq_llm(content=["Hello ", "there"], prompt_tokens=60, completion_tokens=4)
+    model.async_client.before_usage = lambda: asyncio.sleep(0.1)
+    _agent_on(monkeypatch, model)
+    monkeypatch.setattr(session_store, "_sessions", {})
+    cid, _ = metering.add_client("Acme", "starter")
+    sid, _ = session_store.create_session(client_id=cid)
+
+    async def go():
+        body = json.dumps({"session_id": sid, "message": "Hi Ava"}).encode()
+        requested, left = [], anyio.Event()
+
+        async def receive():
+            if not requested:
+                requested.append(True)
+                return {"type": "http.request", "body": body, "more_body": False}
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and b'"token"' in message.get("body", b""):
+                left.set()  # the user closes the tab after the first words
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+                 "method": "POST", "scheme": "http", "path": "/api/message", "raw_path": b"/api/message",
+                 "query_string": b"", "root_path": "", "client": ("127.0.0.1", 1), "server": ("test", 80),
+                 "headers": [(b"host", b"test"), (b"content-type", b"application/json")]}
+        await main.app(scope, receive, send)
+        for _ in range(100):
+            if rows := _rows():
+                return rows
+            await asyncio.sleep(0.02)
+        return []
+    (row,) = anyio.run(go)
+    assert (row["client_id"], row["session_id"]) == (cid, metering.session_ref(sid))
+    assert (row["input_tokens"], row["output_tokens"], row["estimated"]) == (60, 4, 0)
+
+
+def test_failed_model_call_in_a_turn_is_not_recorded(groq_llm, monkeypatch):
+    import session_store
+    model = groq_llm(content=["Hello ", "there"], prompt_tokens=60, completion_tokens=4)
+
+    async def rate_limited():
+        raise _rate_limited()
+    model.async_client.before_usage = rate_limited
+    _agent_on(monkeypatch, model)
+    session = session_store.Session(id="s1", client_id="acme")
+    frames = asyncio.run(_turn_frames(session, "Hi Ava"))
+    assert frames[-1]["type"] == "done"  # Ava apologises instead
+    assert _rows() == [] and model.callbacks[0]._calls == {}
 
 
 def test_ledger_never_holds_a_usable_session_id(api, fake_ava):
@@ -829,6 +997,18 @@ def test_admin_usage_is_closed_without_an_admin_key(api, monkeypatch):
     monkeypatch.setattr(config, "ADMIN_API_KEY", "")
     assert api.get("/api/admin/usage").status_code == 404
     assert api.get("/api/admin/usage", headers=_ADMIN).status_code == 404
+    # Every method looks like a missing page; a 405 would give the route away.
+    for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"):
+        res = api.request(method, "/api/admin/usage", headers=_ADMIN)
+        assert res.status_code == 404, method
+        assert res.json() == api.get("/api/no-such-route").json()
+        assert "allow" not in res.headers
+
+
+def test_admin_usage_only_answers_get_when_open(api, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_API_KEY", "s3cret-admin")
+    for method in ("POST", "DELETE"):
+        assert api.request(method, "/api/admin/usage", headers=_ADMIN).status_code in (404, 405)
 
 
 def test_admin_usage_requires_the_right_key(api, monkeypatch):
@@ -952,6 +1132,53 @@ def test_cli_usage_lists_unregistered_and_unpriced_usage(capsys):
     # No calls at all is an exact $0, not an unpriced n/a.
     default = next(line for line in lines if line.startswith("default"))
     assert "uncapped" in default and "$0.0000" in default
+
+
+def test_cli_usage_shows_estimated_calls(capsys):
+    with metering.context(client_id="ghost"):
+        metering.record("groq", "openai/gpt-oss-120b", 70, 7)
+        metering.record("groq", "openai/gpt-oss-120b", 30, 3, estimated=True)
+    assert manage_clients.main(["usage"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ghost = next(line for line in lines if line.startswith("ghost"))
+    assert "110" in ghost and "(1 estimated call)" in ghost
+    assert "estimated" not in next(line for line in lines if line.startswith("default"))
+
+
+def test_app_shutdown_writes_queued_usage(monkeypatch):
+    import main
+
+    async def no_mcp():
+        pass
+    monkeypatch.setattr(main, "init_mcp", no_mcp)
+    flushed = []
+    monkeypatch.setattr(metering, "flush", lambda: flushed.append(True))
+
+    async def go():
+        async with main._lifespan(main.app):
+            assert flushed == []
+    asyncio.run(go())
+    assert flushed == [True]
+
+
+def test_queued_usage_is_written_at_interpreter_exit(tmp_path):
+    # The process exits straight after the call ends; the row must not be lost.
+    script = (
+        "import metering\n"
+        "from langchain_core.messages import AIMessageChunk\n"
+        "from langchain_core.outputs import ChatGenerationChunk, LLMResult\n"
+        "msg = AIMessageChunk(content='hi', usage_metadata={'input_tokens': 7, 'output_tokens': 2, 'total_tokens': 9})\n"
+        "metering.UsageRecorder('groq', 'm').on_llm_end(LLMResult(generations=[[ChatGenerationChunk(message=msg)]]))\n"
+    )
+    env = {**os.environ, "METERING_DB": str(tmp_path / "exit.db")}
+    done = subprocess.run([sys.executable, "-c", script], cwd=os.path.dirname(metering.__file__), env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    conn = sqlite3.connect(tmp_path / "exit.db")
+    try:
+        assert conn.execute("SELECT total_tokens FROM usage").fetchall() == [(9,)]
+    finally:
+        conn.close()
 
 
 def test_cli_runs_as_a_script(tmp_path):

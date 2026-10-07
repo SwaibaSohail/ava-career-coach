@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 import config
 import metering
@@ -47,6 +47,8 @@ async def _lifespan(app):
     # Load MCP tools once at startup (fail-safe: never blocks the app on error).
     await init_mcp()
     yield
+    # Write usage rows still queued, waiting off the event loop.
+    await run_in_threadpool(metering.flush)
 
 
 app = FastAPI(title="Ava — CV & Job Coach API", lifespan=_lifespan)
@@ -91,6 +93,10 @@ def _client_for_request(key: str | None) -> str:
     try:
         client_id = metering.client_for_key(key)
     except Exception:
+        if config.REQUIRE_CLIENT_KEY:
+            # Keys are mandatory, so the uncapped default client is no fallback.
+            log.error("metering: client key lookup failed; refusing the chat", exc_info=True)
+            raise HTTPException(status_code=503, detail="Usage service unavailable, please try again shortly.")
         # Fail open: never block chats on a metering outage.
         log.error("metering: client key lookup failed; using the default client", exc_info=True)
         return metering.DEFAULT_CLIENT
@@ -177,11 +183,6 @@ _LIMIT_REACHED = (
     "now. Please contact your administrator to raise the limit."
 )
 
-_LIMIT_BUSY = (
-    "Your organisation is close to this month's Ava allowance and other chats are "
-    "using the rest right now. Please try again in a moment."
-)
-
 
 async def _message_events(session, user_message: str):
     """Yield SSE frames for one turn. Checks the client's monthly token allowance
@@ -190,49 +191,44 @@ async def _message_events(session, user_message: str):
     under the session's client (the guard call is billed even when it blocks)."""
     with metering.context(client_id=session.client_id, session_id=session.id or None, feature="chat"):
         # Once per turn, before any model call. A turn that has started may
-        # finish, so a client can go slightly over its allowance. The turn holds
-        # a share of what's left until it ends, so parallel turns can't all start.
-        allowance = await run_in_threadpool(metering.check_allowance, session.client_id, reserve=True)
+        # finish, so a client can go slightly over its allowance; so can turns
+        # that started together, since each passed the check.
+        allowance = await run_in_threadpool(metering.check_allowance, session.client_id)
         if not allowance.allowed:
-            notice = _LIMIT_BUSY if allowance.used < allowance.limit else _LIMIT_REACHED
-            yield f"data: {json.dumps({'type': 'token', 'text': notice})}\n\n"
+            yield f"data: {json.dumps({'type': 'token', 'text': _LIMIT_REACHED})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
-        try:
-            # Runs the (possibly LLM-backed) guard off the event loop so it can't block
-            # other requests.
-            guard = await run_in_threadpool(guard_incoming, user_message)
-            interview = session.interview
-            interview_active = interview is not None and interview.status == "active"
-            if not guard.allowed:
-                reply = guard.safe_reply
-                if interview_active:
-                    # The canned replies talk about CVs; make clear the interview hasn't moved on.
-                    reply += _INTERVIEW_STILL_RUNNING
-                yield f"data: {json.dumps({'type': 'token', 'text': reply})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                return
+        # Runs the (possibly LLM-backed) guard off the event loop so it can't block
+        # other requests.
+        guard = await run_in_threadpool(guard_incoming, user_message)
+        interview = session.interview
+        interview_active = interview is not None and interview.status == "active"
+        if not guard.allowed:
+            reply = guard.safe_reply
             if interview_active:
-                # Interview answers bypass the agent: a small focused evaluator handles them.
-                for kind, data in await run_in_threadpool(handle_turn, session, guard.cleaned_message):
-                    payload = {"type": kind}
-                    if kind == "token":
-                        payload["text"] = data
-                    else:
-                        payload.update(data)
-                    yield f"data: {json.dumps(payload)}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                return
-            async for kind, data in stream_ava(session, guard.cleaned_message):
+                # The canned replies talk about CVs; make clear the interview hasn't moved on.
+                reply += _INTERVIEW_STILL_RUNNING
+            yield f"data: {json.dumps({'type': 'token', 'text': reply})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+        if interview_active:
+            # Interview answers bypass the agent: a small focused evaluator handles them.
+            for kind, data in await run_in_threadpool(handle_turn, session, guard.cleaned_message):
                 payload = {"type": kind}
                 if kind == "token":
                     payload["text"] = data
-                elif kind in ("document", "action", "interview"):
+                else:
                     payload.update(data)
                 yield f"data: {json.dumps(payload)}\n\n"
-        finally:
-            # Also on errors and when the user leaves mid-reply.
-            metering.release(session.client_id, allowance)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+        async for kind, data in stream_ava(session, guard.cleaned_message):
+            payload = {"type": kind}
+            if kind == "token":
+                payload["text"] = data
+            elif kind in ("document", "action", "interview"):
+                payload.update(data)
+            yield f"data: {json.dumps(payload)}\n\n"
 
 
 @app.post("/api/message")
@@ -321,3 +317,10 @@ def admin_usage(month: str | None = None, client_id: str | None = None,
         return metering.usage_report(month=month, client_id=client_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# Any other method gets the same 404 as a missing page: a 405 with an Allow
+# header would show the route exists. Registered after the GET route; a plain
+# ASGI response as the endpoint means no method list, so it takes every method.
+app.add_route("/api/admin/usage", JSONResponse({"detail": "Not Found"}, status_code=404),
+              include_in_schema=False)
