@@ -5,6 +5,7 @@ Python; only stage 5 (check_input_llm) makes a paid API call, and it runs only
 if 1-4 pass.
 """
 
+import logging
 import math
 import re
 import unicodedata
@@ -12,6 +13,8 @@ from collections import Counter
 from dataclasses import dataclass
 
 import config
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -190,7 +193,8 @@ def check_input_llm(message: str) -> str:
         from llm import get_llm
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = get_llm(temperature=0, model=config.GUARD_MODEL)
+        llm = get_llm(temperature=0, model=config.GUARD_MODEL,
+                      reasoning_effort=config.GUARD_REASONING_EFFORT)
         with metering.feature("guard"):
             resp = llm.invoke(
                 [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
@@ -201,8 +205,12 @@ def check_input_llm(message: str) -> str:
             if label in upper:
                 return label
         return "CLEAN"
-    except Exception:
-        return "CLEAN"  # fail-open: never block real users on an outage
+    except Exception as exc:
+        # Fail open: never block real users on an outage. Log the model and the
+        # error (never the message) so a retired model or outage is visible.
+        log.warning("guard model %s failed (%s: %s); skipping the LLM check",
+                    config.GUARD_MODEL, type(exc).__name__, exc)
+        return "CLEAN"
 
 
 # --- Guarded replies (canned; NEVER calls an LLM) ----------------------------

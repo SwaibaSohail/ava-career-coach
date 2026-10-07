@@ -11,8 +11,11 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # Guardrails: a small, cheap model for the ingress LLM safety check (stage 5),
-# kept separate from the main GROQ_MODEL. Fail-open if it errors.
-GUARD_MODEL = os.getenv("GUARD_MODEL", "llama-3.1-8b-instant")
+# kept separate from the main GROQ_MODEL. Fail-open if it errors (logged).
+GUARD_MODEL = os.getenv("GUARD_MODEL", "openai/gpt-oss-20b")
+# Reasoning effort for the guard (gpt-oss models): "low" keeps it fast and cuts
+# output tokens. Leave it empty for a non-reasoning model so it is not sent.
+GUARD_REASONING_EFFORT = os.getenv("GUARD_REASONING_EFFORT", "low")
 GUARD_LLM_ENABLED = os.getenv("GUARD_LLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # Max characters kept from an incoming chat message before it reaches the agent.
