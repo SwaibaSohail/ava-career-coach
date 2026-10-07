@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from contextlib import closing
 
 import anyio
 import groq
@@ -99,6 +100,46 @@ def test_ledger_from_before_estimates_is_upgraded_in_place(monkeypatch):
     assert [(r["total_tokens"], r["estimated"]) for r in _rows()] == [(120, 0), (15, 0), (2, 1)]
     (acme,) = [c for c in metering.usage_report("2026-10")["clients"] if c["client_id"] == "acme-123456"]
     assert acme["used_tokens"] == 135 and acme["estimated_calls"] == 0
+
+
+def test_ledger_upgrade_tolerates_another_process_adding_the_column_first(monkeypatch):
+    # The server and the CLI (or two workers) open a pre-upgrade ledger at the
+    # same moment: both see the column missing, and the other one adds it first.
+    old = sqlite3.connect(config.METERING_DB)
+    old.execute("CREATE TABLE usage (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL, "
+                "client_id TEXT NOT NULL, session_id TEXT, feature TEXT NOT NULL, provider TEXT NOT NULL, "
+                "model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, "
+                "total_tokens INTEGER NOT NULL, cost_usd REAL)")
+    old.close()
+    real_connect = sqlite3.connect
+
+    class OtherProcessWinsTheRace:
+        def __init__(self, conn):
+            self._conn = conn
+            self._raced = False
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def execute(self, sql, *args):
+            result = self._conn.execute(sql, *args)
+            if sql.startswith("PRAGMA table_info") and not self._raced:
+                self._raced = True
+                columns = result.fetchall()   # what this process saw: no column yet
+                with closing(real_connect(config.METERING_DB)) as other:
+                    other.execute("ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0")
+                return iter(columns)
+            return result
+
+    connects = []
+
+    def connect(*args, **kwargs):
+        connects.append(args)
+        conn = real_connect(*args, **kwargs)
+        return OtherProcessWinsTheRace(conn) if len(connects) == 1 else conn
+    monkeypatch.setattr(metering.sqlite3, "connect", connect)
+    metering.record("groq", "openai/gpt-oss-120b", 10, 5, estimated=True)
+    assert [(r["total_tokens"], r["estimated"]) for r in _rows()] == [(15, 1)]
 
 
 def test_feature_overrides_only_feature_and_resets():
@@ -373,6 +414,18 @@ def test_usage_report_includes_usage_from_unregistered_clients(monkeypatch):
     assert clients["ghost"]["plan"] is None and clients["ghost"]["remaining_tokens"] is None
 
 
+def test_client_cost_is_null_when_any_call_is_unpriced(monkeypatch, capsys):
+    # A partial sum would bill every unpriced call as $0.
+    acme, _ = metering.add_client("Acme", "starter")
+    _record_at(monkeypatch, "2026-10-06T09:00:00.000000Z", "openai/gpt-oss-20b", 10, 5, client_id=acme)
+    _record_at(monkeypatch, "2026-10-06T10:00:00.000000Z", "mystery-model", 50, 5, client_id=acme)
+    (client,) = metering.usage_report("2026-10", client_id=acme)["clients"]
+    assert (client["cost_usd"], client["unpriced_calls"], client["used_tokens"]) == (None, 1, 70)
+    assert manage_clients.main(["usage", "--month", "2026-10", "--client", acme]) == 0
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith(acme))
+    assert "n/a" in line and "$" not in line and "1 unpriced call" in line
+
+
 def test_usage_report_rejects_bad_month():
     with pytest.raises(ValueError):
         metering.usage_report("2026-13")
@@ -482,6 +535,41 @@ def test_recorder_records_nothing_for_a_failed_call():
     recorder = metering.UsageRecorder("groq", "openai/gpt-oss-120b")
     recorder.on_llm_error(_rate_limited(), run_id=_open_call(recorder))
     assert _rows() == [] and recorder._calls == {}
+
+
+def test_recorder_records_nothing_for_a_call_cut_off_before_groq_answered():
+    # No chunk yet means Groq may never have accepted the request (the client
+    # was still connecting, or waiting to retry a rate limit), so nothing is billed.
+    recorder = metering.UsageRecorder("groq", "openai/gpt-oss-120b")
+    run_id = uuid.uuid4()
+    recorder.on_chat_model_start({}, [[HumanMessage("Tailor my CV for a data role")]], run_id=run_id)
+    recorder.on_llm_error(asyncio.CancelledError(), run_id=run_id)
+    assert _rows() == [] and recorder._calls == {}
+
+
+def test_call_cancelled_while_waiting_to_retry_a_rate_limit_is_not_recorded(monkeypatch):
+    # A real ChatGroq and groq client; only the HTTP transport is faked. Groq
+    # answers 429 and the client sleeps before retrying, as it does in a rate
+    # limit spell. The user gives up during that sleep: Groq billed nothing.
+    monkeypatch.setattr(config, "GROQ_API_KEY", "test-key")
+    sent = []
+
+    def rate_limited(request):
+        sent.append(request)
+        return httpx.Response(429, headers={"retry-after": "3"}, json={"error": {"message": "Rate limit reached"}})
+    model = llm.get_llm()
+    model.async_client = groq.AsyncGroq(
+        api_key="test-key", http_client=httpx.AsyncClient(transport=httpx.MockTransport(rate_limited)),
+    ).chat.completions
+
+    async def go():
+        with metering.context(client_id="acme", feature="chat"):
+            with anyio.move_on_after(0.5):
+                async for _ in model.astream("Hi Ava"):
+                    pass
+    anyio.run(go)
+    assert len(sent) == 1
+    assert _rows() == [] and model.callbacks[0]._calls == {}
 
 
 # --- Model calls (a real ChatGroq with a fake HTTP client) ----------------
@@ -1003,6 +1091,11 @@ def test_admin_usage_is_closed_without_an_admin_key(api, monkeypatch):
         assert res.status_code == 404, method
         assert res.json() == api.get("/api/no-such-route").json()
         assert "allow" not in res.headers
+    # Nor may a trailing slash redirect to it, where a missing page gets a 404.
+    for method in ("GET", "POST", "DELETE"):
+        res = api.request(method, "/api/admin/usage/", headers=_ADMIN, follow_redirects=False)
+        assert res.status_code == 404, method
+        assert res.json() == api.get("/api/no-such-route").json()
 
 
 def test_admin_usage_only_answers_get_when_open(api, monkeypatch):

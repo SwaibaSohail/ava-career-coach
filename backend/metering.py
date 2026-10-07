@@ -126,6 +126,10 @@ def _db_path() -> str:
     return path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
 
 
+def _has_estimated(conn: sqlite3.Connection) -> bool:
+    return "estimated" in {col[1] for col in conn.execute("PRAGMA table_info(usage)")}
+
+
 def _connect() -> sqlite3.Connection:
     """A fresh connection per operation (safe across threads), schema ensured once per path."""
     path = _db_path()
@@ -136,8 +140,13 @@ def _connect() -> sqlite3.Connection:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(_SCHEMA)
                 # Ledgers from before cut-off replies were recorded lack this column.
-                if "estimated" not in {col[1] for col in conn.execute("PRAGMA table_info(usage)")}:
-                    conn.execute("ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0")
+                if not _has_estimated(conn):
+                    try:
+                        conn.execute("ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0")
+                    except sqlite3.OperationalError:
+                        # Another process (the CLI, a second worker) added it first.
+                        if not _has_estimated(conn):
+                            raise
                 conn.execute(
                     "INSERT OR IGNORE INTO clients (client_id, name, plan, key_hash, created_utc) "
                     "VALUES (?, ?, ?, NULL, ?)",
@@ -319,6 +328,7 @@ class _Call:
     ctx: dict                               # attribution, read when the call started
     input_tokens: int                       # estimated from the prompt
     output_chars: int = 0                   # streamed so far
+    answered: bool = False                  # a chunk arrived: Groq accepted the request
     usage: tuple[int, int] | None = None    # exact, once a chunk carries it
     task: asyncio.Task | None = None        # the async task running the call
     on_task_done: Callable | None = None
@@ -370,6 +380,7 @@ class UsageRecorder(BaseCallbackHandler):
         if call is None:
             return
         message = getattr(chunk, "message", None)
+        call.answered = True
         call.output_chars += _output_chars(token, message)
         usage = getattr(message, "usage_metadata", None)
         if usage:
@@ -405,7 +416,12 @@ class UsageRecorder(BaseCallbackHandler):
 
     def _cut_off(self, call: _Call) -> None:
         """Record a call cut off mid-reply: Groq bills what it generated. Exact if
-        the provider's count arrived before the cut, else estimated from the text."""
+        the provider's count arrived before the cut, else estimated from the text.
+
+        A call cut off before its first chunk isn't recorded: Groq may never have
+        accepted it (the client was still connecting, or waiting to retry a 429)."""
+        if not call.answered:
+            return
         if call.usage is not None:
             _enqueue(self.provider, self.model, *call.usage, ctx=call.ctx)
         else:
@@ -519,7 +535,8 @@ _REPORT_NOTE = (
     "Token counts are exact, as reported by the model provider, except for replies cut off "
     "mid-stream (e.g. the user left), which are recorded as estimates (estimated=1, about 4 "
     "characters per token; see estimated_calls). Costs are estimates from pricing.json "
-    "(prompt-cache discounts ignored); null means the model has no price entry."
+    "(prompt-cache discounts ignored); null means a model has no price entry (a client's "
+    "total is null if any of its calls is unpriced; see unpriced_calls)."
 )
 
 
@@ -563,8 +580,9 @@ def usage_report(month: str | None = None, client_id: str | None = None) -> dict
             "remaining_tokens": None if limit is None else max(limit - used, 0),
             "input_tokens": t.get("input_tokens") or 0,
             "output_tokens": t.get("output_tokens") or 0,
-            # null only when unpriced calls leave the cost unknown; no calls at all is $0.
-            "cost_usd": t.get("cost_usd") if unpriced else (t.get("cost_usd") or 0.0),
+            # null when any unpriced call leaves the cost unknown (SUM would count it
+            # as $0); no calls at all is $0.
+            "cost_usd": None if unpriced else (t.get("cost_usd") or 0.0),
             "unpriced_calls": unpriced,
             "estimated_calls": t.get("estimated_calls") or 0,
         })

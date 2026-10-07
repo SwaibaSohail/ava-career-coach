@@ -127,7 +127,8 @@ Pakistan).
 
 **Cost.** `backend/pricing.json` holds our USD price per 1M tokens for each model.
 Token counts are exact (reported by Groq); cost is an estimate, and a model missing
-from the file is recorded with cost `null` (unpriced), never 0. Restart the backend
+from the file is recorded with cost `null` (unpriced), never 0; a client's monthly
+cost is `null` if any of its calls is unpriced. Restart the backend
 after editing either JSON file.
 
 **Cut-off replies.** If a model call is cut off mid-reply (usually because the user
@@ -135,7 +136,8 @@ closed the chat), Groq still bills what it generated, but its token count, which
 comes at the end of the reply, never arrives. Such a call is recorded with
 `estimated = 1`: input tokens from the prompt's length, output tokens from the text
 streamed so far, at about 4 characters per token. A request that fails outright (an
-HTTP error or rate limit) isn't billed by Groq and isn't recorded. Older ledgers
+HTTP error or rate limit) isn't billed by Groq and isn't recorded, nor is one cut
+off before Groq starts answering (e.g. while waiting to retry a rate limit). Older ledgers
 gain the `estimated` column automatically.
 
 **Report.** Set `ADMIN_API_KEY` in `backend/.env` to enable

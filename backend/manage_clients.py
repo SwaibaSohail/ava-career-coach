@@ -20,7 +20,7 @@ def _fmt_limit(limit):
 
 
 def _fmt_cost(client):
-    # The report gives null cost only when unpriced calls leave it unknown.
+    # The report gives null cost when any unpriced call leaves it unknown.
     return "n/a" if client["cost_usd"] is None else f"${client['cost_usd']:.4f}"
 
 

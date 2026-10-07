@@ -322,5 +322,7 @@ def admin_usage(month: str | None = None, client_id: str | None = None,
 # Any other method gets the same 404 as a missing page: a 405 with an Allow
 # header would show the route exists. Registered after the GET route; a plain
 # ASGI response as the endpoint means no method list, so it takes every method.
-app.add_route("/api/admin/usage", JSONResponse({"detail": "Not Found"}, status_code=404),
-              include_in_schema=False)
+# The trailing-slash form too: unmatched, it would redirect here, which a
+# missing page never does.
+for _path in ("/api/admin/usage", "/api/admin/usage/"):
+    app.add_route(_path, JSONResponse({"detail": "Not Found"}, status_code=404), include_in_schema=False)
