@@ -54,7 +54,7 @@ def test_record_uses_context_and_defaults():
         metering.record("groq", "openai/gpt-oss-120b", 10, 5)
     first, second = _rows()
     assert (first["client_id"], first["session_id"], first["feature"]) == ("default", None, "unknown")
-    assert (second["client_id"], second["session_id"], second["feature"]) == ("acme", "s1", "chat")
+    assert (second["client_id"], second["session_id"], second["feature"]) == ("acme", metering.session_ref("s1"), "chat")
     assert second["total_tokens"] == 15 and second["provider"] == "groq"
     assert first["ts_utc"].endswith("Z")
 
@@ -129,6 +129,35 @@ def test_malformed_price_entry_still_records_tokens(monkeypatch):
     metering.record("groq", "half-priced", 100, 10)
     (row,) = _rows()
     assert row["cost_usd"] is None and row["total_tokens"] == 110
+
+
+@pytest.mark.parametrize("content", ['{"openai/gpt-oss-120b": {"input": 0.15, "output": 0.6},}', "[]"])
+def test_unreadable_pricing_file_still_records_tokens(tmp_path, monkeypatch, caplog, content):
+    # A stray comma in the hand-edited price list must cost us prices, not rows.
+    bad = tmp_path / "pricing.json"
+    bad.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(config, "PRICING_FILE", str(bad))
+    monkeypatch.setattr(metering, "_prices", None)
+    monkeypatch.setattr(metering, "_warned_models", set())
+    with caplog.at_level(logging.ERROR, logger="metering"):
+        with metering.context(client_id="acme", feature="chat"):
+            metering.UsageRecorder("groq", "openai/gpt-oss-120b").on_llm_end(_streamed_result(40, 9))
+            metering.UsageRecorder("groq", "openai/gpt-oss-120b").on_llm_end(_streamed_result(40, 9))
+    assert [(r["client_id"], r["total_tokens"], r["cost_usd"]) for r in _rows()] == [("acme", 49, None)] * 2
+    # Read (and reported) once, not again on every call.
+    assert sum("could not load" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_unreadable_plans_file_leaves_clients_uncapped(tmp_path, monkeypatch):
+    client_id, _ = metering.add_client("Acme", "suspended")
+    bad = tmp_path / "plans.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(config, "PLANS_FILE", str(bad))
+    monkeypatch.setattr(metering, "_plans", None)
+    _record_for(client_id, 500)
+    assert metering.check_allowance(client_id) == metering.Allowance(True, 500, None)
+    (acme,) = [c for c in metering.usage_report()["clients"] if c["client_id"] == client_id]
+    assert acme["used_tokens"] == 500 and acme["monthly_tokens"] is None
 
 
 # --- Months ---------------------------------------------------------------
@@ -229,6 +258,39 @@ def test_client_on_unknown_plan_is_allowed_with_warning(monkeypatch, caplog):
         allowance = metering.check_allowance(client_id)
     assert allowance.allowed and allowance.limit is None
     assert "unknown plan" in caplog.text
+
+
+def test_turn_holds_a_share_until_released():
+    client_id, _ = metering.add_client("Acme", "free")
+    _record_for(client_id, 99_000)
+    first = metering.check_allowance(client_id, reserve=True)
+    assert first.allowed and first.reserved > 0
+    assert metering.check_allowance(client_id, reserve=True) == metering.Allowance(False, 99_000, 100_000)
+    # A plain check (reports, tests) neither holds nor counts holds.
+    assert metering.check_allowance(client_id) == metering.Allowance(True, 99_000, 100_000)
+    metering.release(client_id, first)
+    again = metering.check_allowance(client_id, reserve=True)
+    assert again.allowed
+    metering.release(client_id, again)
+
+
+def test_allowance_check_rereads_when_a_turn_ends_during_it(monkeypatch):
+    client_id, _ = metering.add_client("Acme", "free")
+    _record_for(client_id, 99_000)
+    first = metering.check_allowance(client_id, reserve=True)
+    real, reads = metering._usage_and_limit, []
+
+    def turn_ends_mid_read(cid):
+        result = real(cid)
+        if not reads:
+            # The running turn writes its last usage and ends just after our read.
+            _record_for(client_id, 15_000)
+            metering.release(client_id, first)
+        reads.append(result)
+        return result
+    monkeypatch.setattr(metering, "_usage_and_limit", turn_ends_mid_read)
+    assert metering.check_allowance(client_id, reserve=True) == metering.Allowance(False, 114_000, 100_000)
+    assert len(reads) == 2
 
 
 def test_allowance_check_fails_open(monkeypatch, caplog):
@@ -387,6 +449,44 @@ def test_streamed_call_is_recorded_once(groq_llm):
     assert (row["input_tokens"], row["output_tokens"]) == (20, 2)
 
 
+def test_locked_ledger_does_not_freeze_the_event_loop(groq_llm):
+    # Another writer (e.g. a DB browser with an unsaved edit) holds the ledger's
+    # write lock. Recording must wait for it off the event loop, so other chats
+    # keep streaming and the holder can finish; inline, the loop would freeze for
+    # the whole busy timeout and the row would be lost.
+    model = groq_llm(prompt_tokens=15, completion_tokens=3)
+    asyncio.run(model.ainvoke("warm up"))  # one-off client setup, before the clock starts
+    holder = sqlite3.connect(config.METERING_DB, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        gaps, running = [], True
+
+        async def heartbeat():
+            last = loop.time()
+            while running:
+                await asyncio.sleep(0.02)
+                gaps.append(loop.time() - last)
+                last = loop.time()
+        beat = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.05)
+        # Only a running loop can let the other writer finish.
+        loop.call_later(0.3, holder.execute, "COMMIT")
+        with metering.context(client_id="acme", session_id="s1", feature="chat"):
+            await model.ainvoke("hello")
+        running = False
+        await beat
+        return max(gaps)
+    try:
+        longest_gap = asyncio.run(go())
+    finally:
+        holder.close()
+    assert longest_gap < 1.0
+    row = _rows()[-1]
+    assert (row["client_id"], row["feature"], row["input_tokens"]) == ("acme", "chat", 15)
+
+
 def test_agent_turn_records_under_client_and_chat_feature(groq_llm):
     from langchain.agents import create_agent
 
@@ -401,7 +501,7 @@ def test_agent_turn_records_under_client_and_chat_feature(groq_llm):
     # Streamed like main.py's agent turns, so usage came from the final x_groq chunk.
     assert [c.get("stream") for c in model.async_client.calls] == [True]
     (row,) = _rows()
-    assert (row["client_id"], row["session_id"], row["feature"]) == ("acme", "s1", "chat")
+    assert (row["client_id"], row["session_id"], row["feature"]) == ("acme", metering.session_ref("s1"), "chat")
     assert (row["input_tokens"], row["output_tokens"]) == (80, 3)
 
 
@@ -529,6 +629,94 @@ def test_used_up_monthly_allowance_is_enforced(api, monkeypatch):
     assert "allowance" in _reply(_send(api, sid, "Hello again"))
 
 
+def _allow_all(message):
+    return guardrails.GuardResult(allowed=True, cleaned_message=message, category=None,
+                                  safe_reply=None, dialect="en")
+
+
+async def _turn_frames(session, text):
+    import main
+    return [json.loads(f[len("data: "):]) async for f in main._message_events(session, text)]
+
+
+def test_parallel_turns_cannot_all_pass_one_allowance_check(monkeypatch):
+    # Usage is only written as each model call ends, so a burst of turns would
+    # all see the same "used" figure and a capped client could blow far past
+    # its limit in one go.
+    import main
+    import session_store
+    cid, _ = metering.add_client("Acme", "free")
+    _record_for(cid, 99_000)
+    sessions = [session_store.Session(id=f"s{i}", client_id=cid) for i in range(3)]
+    monkeypatch.setattr(main, "guard_incoming", _allow_all)
+    started = []
+
+    async def tool_using_turn(session, message):
+        started.append(session.id)
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+            metering.record("groq", "openai/gpt-oss-120b", 5_000, 0)
+        yield ("token", "Done.")
+        yield ("done", None)
+    monkeypatch.setattr(main, "stream_ava", tool_using_turn)
+
+    async def burst():
+        return await asyncio.gather(*(_turn_frames(sessions[i % 3], "Find me jobs") for i in range(30)))
+    replies = [_reply(frames) for frames in asyncio.run(burst())]
+    assert len(started) == 1 and replies.count("Done.") == 1
+    # Told to wait while that turn runs, or that the allowance is gone once it's done.
+    assert all("allowance" in r for r in replies if r != "Done.")
+    assert metering.check_allowance(cid).used == 99_000 + 15_000
+
+
+def test_a_finished_or_abandoned_turn_frees_the_allowance_it_held(monkeypatch):
+    import main
+    import session_store
+    cid, _ = metering.add_client("Acme", "free")
+    _record_for(cid, 99_000)
+    session = session_store.Session(id="s1", client_id=cid)
+    monkeypatch.setattr(main, "guard_incoming", _allow_all)
+    calls = []
+
+    async def turn(session, message):
+        calls.append(message)
+        yield ("token", f"Reply {len(calls)}.")
+        if len(calls) == 1:
+            await asyncio.Event().wait()  # stalls until the user closes the tab
+        yield ("done", None)
+    monkeypatch.setattr(main, "stream_ava", turn)
+
+    async def go():
+        first = main._message_events(session, "one")
+        assert "Reply 1." in await first.__anext__()
+        while_running = _reply(await _turn_frames(session, "two"))
+        await first.aclose()
+        after_leaving = _reply(await _turn_frames(session, "three"))
+        after_finishing = _reply(await _turn_frames(session, "four"))
+        return while_running, after_leaving, after_finishing
+    while_running, after_leaving, after_finishing = asyncio.run(go())
+    assert "try again" in while_running and calls[1:] == ["three", "four"]
+    assert (after_leaving, after_finishing) == ("Reply 2.", "Reply 3.")
+
+
+def test_uncapped_clients_run_turns_in_parallel(monkeypatch):
+    import main
+    import session_store
+    _record_for(metering.DEFAULT_CLIENT, 10_000_000)
+    session = session_store.Session(id="s1")
+    monkeypatch.setattr(main, "guard_incoming", _allow_all)
+
+    async def turn(session, message):
+        await asyncio.sleep(0.01)
+        yield ("token", "Done.")
+        yield ("done", None)
+    monkeypatch.setattr(main, "stream_ava", turn)
+
+    async def burst():
+        return await asyncio.gather(*(_turn_frames(session, "hi") for _ in range(10)))
+    assert [_reply(frames) for frames in asyncio.run(burst())] == ["Done."] * 10
+
+
 def test_over_limit_also_gates_interview_turns(api, monkeypatch):
     import main
     import session_store
@@ -546,6 +734,25 @@ def test_over_limit_also_gates_interview_turns(api, monkeypatch):
     assert it.current == 0 and it.results == []
 
 
+def test_interview_answer_is_billed_to_the_session_client(api, groq_llm, monkeypatch):
+    import session_store
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", False)
+    monkeypatch.setattr(interview, "get_llm", lambda **kw: groq_llm(
+        content='{"score": 7, "feedback": "Clear; add numbers."}', prompt_tokens=50, completion_tokens=6, **kw))
+    cid, key = metering.add_client("Acme", "starter")
+    sid = _start(api, key)
+    session_store.get_session(sid).interview = session_store.InterviewSession(
+        id="iv1", role="Python Developer", job_summary="Builds APIs.",
+        questions=[session_store.InterviewQuestion(text="Tell me about an API you built.", kind="technical"),
+                   session_store.InterviewQuestion(text="How do you test it?", kind="technical")])
+    # Scored off the event loop: the client and session must survive the hop.
+    frames = _send(api, sid, "I built a payments API in FastAPI.")
+    assert "7/10" in _reply(frames) and frames[-1]["type"] == "done"
+    (row,) = _rows()
+    assert (row["client_id"], row["session_id"], row["feature"]) == (cid, metering.session_ref(sid), "interview.score")
+    assert metering.check_allowance(cid).used == 56
+
+
 def test_guard_call_is_billed_when_it_blocks(api, groq_llm, monkeypatch):
     import main
     monkeypatch.setattr(config, "GUARD_LLM_ENABLED", True)
@@ -557,7 +764,7 @@ def test_guard_call_is_billed_when_it_blocks(api, groq_llm, monkeypatch):
     frames = _send(api, sid, "Please tell me about the weather today")
     assert "follow instructions embedded" in _reply(frames) and frames[-1]["type"] == "done"
     (row,) = _rows()
-    assert (row["feature"], row["client_id"], row["session_id"]) == ("guard", cid, sid)
+    assert (row["feature"], row["client_id"], row["session_id"]) == ("guard", cid, metering.session_ref(sid))
     assert row["model"] == config.GUARD_MODEL
 
 
@@ -578,9 +785,22 @@ def test_chat_turn_is_billed_to_the_session_client(api, fake_ava):
     frames = _send(api, sid, "Hi Ava")
     assert "Hello from Ava" in _reply(frames) and frames[-1]["type"] == "done"
     (row,) = _rows()
-    assert (row["client_id"], row["session_id"], row["feature"]) == (cid, sid, "chat")
+    assert (row["client_id"], row["session_id"], row["feature"]) == (cid, metering.session_ref(sid), "chat")
     assert (row["input_tokens"], row["output_tokens"]) == (60, 4)
     assert metering.check_allowance(cid).used == 64
+
+
+def test_ledger_never_holds_a_usable_session_id(api, fake_ava):
+    import session_store
+    first, second = _start(api), _start(api)
+    for sid in (first, first, second):
+        _send(api, sid, "Hi Ava")
+    a1, a2, b = (r["session_id"] for r in _rows())
+    # A session id alone opens a chat (and the CV uploaded to it), so the ledger
+    # keeps a one-way reference: enough to group a chat's calls, useless as a key.
+    assert a1 == a2 != b
+    assert {a1, b}.isdisjoint({first, second})
+    assert session_store.get_session(a1) is None and session_store.get_session(b) is None
 
 
 def test_chat_still_streams_when_recording_fails(api, fake_ava, monkeypatch):
@@ -637,6 +857,18 @@ def test_admin_usage_filters_by_month_and_client(api, monkeypatch):
     assert body["month"] == "2026-10"
     assert [(c["client_id"], c["used_tokens"]) for c in body["clients"]] == [(beta, 22)]
     assert [r["client_id"] for r in body["breakdown"]] == [beta]
+
+
+def test_admin_usage_reports_zero_cost_for_clients_without_calls(api, monkeypatch):
+    # null cost means "unpriced"; a client that made no calls cost exactly $0.
+    monkeypatch.setattr(config, "ADMIN_API_KEY", "s3cret-admin")
+    acme, _ = metering.add_client("Acme", "starter")
+    _record_at(monkeypatch, "2026-10-06T09:00:00.000000Z", "mystery-model", 10, 1, client_id="ghost")
+    body = api.get("/api/admin/usage", params={"month": "2026-10"}, headers=_ADMIN).json()
+    clients = {c["client_id"]: c for c in body["clients"]}
+    assert (clients[acme]["cost_usd"], clients[acme]["unpriced_calls"]) == (0.0, 0)
+    assert clients["default"]["cost_usd"] == 0.0
+    assert (clients["ghost"]["cost_usd"], clients["ghost"]["unpriced_calls"]) == (None, 1)
 
 
 def test_admin_usage_is_left_out_of_the_public_api_docs(api):

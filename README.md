@@ -91,8 +91,9 @@ often don't — paste the text in those cases. Each fetch call spawns the server
 Ava records every LLM call in a local SQLite ledger, `backend/data/usage.db`
 (gitignored), so clients can be billed by tokens or sold monthly allowances. Each
 row holds the time, client, chat session, feature (`chat`, `guard`, `interview.*`),
-model, input/output tokens and an estimated cost — **never message text**. Users
-never see usage.
+model, input/output tokens and an estimated cost — **never message text**. The chat
+session is stored as a one-way hash, because a session id on its own opens that
+chat. Users never see usage.
 
 **Clients and keys.** From `backend/`, create a client; its key is printed once
 and stored only as a hash:
@@ -115,7 +116,9 @@ without a key count under the built-in, uncapped `default` client; set
 limits, and `suspended` blocks a client without deleting its history. At the limit,
 Ava tells the user their organisation has used this month's allowance and makes no
 model call; a turn that has already started may finish, so a client can go slightly
-over.
+over. Each turn in flight holds a share of what's left (`TURN_TOKEN_RESERVE`, 20,000
+tokens by default), so a burst of parallel chats can't all start on the last few
+tokens; near the limit, the extra chats are asked to try again in a moment.
 Months are calendar months in **UTC** (they roll over at 05:00 on the 1st in
 Pakistan).
 

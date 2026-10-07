@@ -3,7 +3,8 @@
 Every model Ava creates comes from llm.get_llm, which attaches one UsageRecorder.
 After each successful call the recorder writes one row to a small SQLite ledger:
 when, which client and chat session, which feature, which model, tokens in/out
-and our estimated cost. No message text is ever stored.
+and our estimated cost. No message text is ever stored, and a chat session only
+as a one-way hash of its id (see session_ref).
 
 Which client and feature a call belongs to comes from context variables set by
 the caller (metering.context / metering.feature). anyio's run_in_threadpool and
@@ -181,6 +182,16 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float | 
 
 # --- Recording ------------------------------------------------------------
 
+def session_ref(session_id: str | None) -> str | None:
+    """What the ledger stores for a chat session: a one-way hash, never the id.
+
+    A session id alone opens a chat (and the CV uploaded to it), so it must not
+    sit in billing data. The hash still groups a chat's calls. Session ids are
+    random UUIDs, so, as with client keys, a plain SHA-256 can't be reversed.
+    """
+    return None if session_id is None else hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+
 def record(provider: str, model: str, input_tokens: int, output_tokens: int) -> None:
     """Write one usage row attributed from the current context. Raises on DB errors."""
     ctx = current()
@@ -189,7 +200,7 @@ def record(provider: str, model: str, input_tokens: int, output_tokens: int) -> 
         conn.execute(
             "INSERT INTO usage (ts_utc, client_id, session_id, feature, provider, model, "
             "input_tokens, output_tokens, total_tokens, cost_usd) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (_now(), ctx["client_id"], ctx["session_id"], ctx["feature"], provider, model,
+            (_now(), ctx["client_id"], session_ref(ctx["session_id"]), ctx["feature"], provider, model,
              inp, out, inp + out, estimate_cost(model, inp, out)),
         )
 
@@ -223,9 +234,13 @@ class UsageRecorder(BaseCallbackHandler):
     Attached once, through the model constructor in llm.get_llm — never also at
     invoke time, so each call is counted exactly once. Failed calls (which the
     client retries) never reach on_llm_end.
+
+    Not run_inline: on async calls (the agent's turns) LangChain then runs this
+    in its executor under a copy of the caller's context, so attribution is kept
+    and a locked ledger can't stall the event loop for the busy timeout. Sync
+    calls run it directly, as before.
     """
 
-    run_inline = True     # record synchronously, in the caller's context
     raise_error = False   # a metering failure must never break a chat
 
     def __init__(self, provider: str, model: str):
@@ -320,27 +335,81 @@ class Allowance:
     allowed: bool
     used: int
     limit: int | None   # None = uncapped
+    reserved: int = 0   # tokens this turn holds until release()
 
 
-def check_allowance(client_id: str) -> Allowance:
-    """Tokens used this UTC month vs the client's plan. Fails open on any error."""
+# Tokens held by capped clients' turns in flight, and how many of those turns
+# have ended. In memory, like chat sessions.
+_reserve_lock = threading.Lock()
+_reserved: dict[str, int] = {}
+_ended: dict[str, int] = {}
+
+
+def _usage_and_limit(client_id: str) -> tuple[int, int | None]:
+    _, start, end = month_bounds()
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT plan FROM clients WHERE client_id = ?", (client_id,)).fetchone()
+        used = conn.execute(
+            "SELECT COALESCE(SUM(total_tokens), 0) FROM usage "
+            "WHERE client_id = ? AND ts_utc >= ? AND ts_utc < ?",
+            (client_id, start, end),
+        ).fetchone()[0]
+    if row is None:
+        log.warning("metering: unknown client %r; treating it as uncapped", client_id)
+        return used, None
+    return used, _plan_limit(row["plan"])
+
+
+def check_allowance(client_id: str, reserve: bool = False) -> Allowance:
+    """Tokens used this UTC month vs the client's plan. Fails open on any error.
+
+    reserve=True is for a chat turn about to start. Usage is only written as each
+    model call ends, so parallel turns would all pass on the same "used" figure;
+    instead, tokens held by the client's turns in flight count as used, and an
+    allowed turn holds config.TURN_TOKEN_RESERVE more until release(). Uncapped
+    clients hold nothing.
+    """
     try:
-        _, start, end = month_bounds()
-        with closing(_connect()) as conn:
-            row = conn.execute("SELECT plan FROM clients WHERE client_id = ?", (client_id,)).fetchone()
-            used = conn.execute(
-                "SELECT COALESCE(SUM(total_tokens), 0) FROM usage "
-                "WHERE client_id = ? AND ts_utc >= ? AND ts_utc < ?",
-                (client_id, start, end),
-            ).fetchone()[0]
-        if row is None:
-            log.warning("metering: unknown client %r; treating it as uncapped", client_id)
-            return Allowance(True, used, None)
-        limit = _plan_limit(row["plan"])
-        return Allowance(limit is None or used < limit, used, limit)
+        if not reserve:
+            used, limit = _usage_and_limit(client_id)
+            return Allowance(limit is None or used < limit, used, limit)
+        for _ in range(5):
+            with _reserve_lock:
+                ended = _ended.get(client_id, 0)
+            # Read outside the lock, so release() (on the event loop) never waits on the ledger.
+            used, limit = _usage_and_limit(client_id)
+            if limit is None:
+                return Allowance(True, used, None)
+            with _reserve_lock:
+                if _ended.get(client_id, 0) != ended:
+                    # A turn ended during the read: its hold is gone, but its
+                    # usage may be missing from `used`. Read again.
+                    continue
+                held = _reserved.get(client_id, 0)
+                if used + held >= limit:
+                    return Allowance(False, used, limit)
+                hold = config.TURN_TOKEN_RESERVE
+                _reserved[client_id] = held + hold
+                return Allowance(True, used, limit, reserved=hold)
+        # Turns keep ending under us; this one can try again in a moment.
+        return Allowance(False, used, limit)
     except Exception:
         log.error("metering: allowance check failed; allowing the turn", exc_info=True)
         return Allowance(True, 0, None)
+
+
+def release(client_id: str, allowance: Allowance) -> None:
+    """Give back what a turn's check reserved. Call once, when the turn ends
+    (after its usage is written)."""
+    if not allowance.reserved:
+        return
+    with _reserve_lock:
+        left = _reserved.get(client_id, 0) - allowance.reserved
+        if left > 0:
+            _reserved[client_id] = left
+        else:
+            _reserved.pop(client_id, None)
+        _ended[client_id] = _ended.get(client_id, 0) + 1
 
 
 # --- Report ---------------------------------------------------------------
@@ -381,6 +450,7 @@ def usage_report(month: str | None = None, client_id: str | None = None) -> dict
     for row in known:
         t = totals.get(row["client_id"], {})
         used = t.get("total_tokens") or 0
+        unpriced = t.get("unpriced_calls") or 0
         limit = None if row["plan"] is None else _plan_limit(row["plan"])
         clients.append({
             "client_id": row["client_id"], "name": row["name"], "plan": row["plan"],
@@ -389,8 +459,9 @@ def usage_report(month: str | None = None, client_id: str | None = None) -> dict
             "remaining_tokens": None if limit is None else max(limit - used, 0),
             "input_tokens": t.get("input_tokens") or 0,
             "output_tokens": t.get("output_tokens") or 0,
-            "cost_usd": t.get("cost_usd"),
-            "unpriced_calls": t.get("unpriced_calls") or 0,
+            # null only when unpriced calls leave the cost unknown; no calls at all is $0.
+            "cost_usd": t.get("cost_usd") if unpriced else (t.get("cost_usd") or 0.0),
+            "unpriced_calls": unpriced,
         })
     return {
         "month": label, "timezone": "UTC",
