@@ -711,6 +711,27 @@ def test_guard_call_is_tagged_guard(groq_llm, monkeypatch):
     assert (row["client_id"], row["feature"], row["model"]) == ("acme", "guard", config.GUARD_MODEL)
 
 
+def test_groq_guard_bills_its_callers_feature(groq_llm, monkeypatch):
+    # The offline eval runs the guard as eval.guard; check_input_llm runs it as guard.
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: groq_llm(content="CLEAN", **kw))
+    with metering.feature("eval.guard"):
+        assert guardrails._groq_guard("How do I improve my CV?") == "CLEAN"
+    (row,) = _rows()
+    assert (row["provider"], row["feature"]) == ("groq", "eval.guard")
+
+
+def test_groq_fallback_for_a_failed_clef_check_is_tagged_guard(clef_api, groq_llm, monkeypatch):
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(config, "GUARD_BACKEND", "clef")
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: groq_llm(content="CLEAN", **kw))
+    clef_api.error(503)
+    with metering.context(client_id="acme", feature="chat"):
+        assert guardrails.check_input_llm("How do I improve my CV?") == "CLEAN"
+        assert metering.current()["feature"] == "chat"
+    (row,) = _rows()
+    assert (row["provider"], row["client_id"], row["feature"]) == ("groq", "acme", "guard")
+
+
 def test_interview_calls_are_tagged_by_step(groq_llm, monkeypatch):
     replies = iter([
         '{"role": "Python Developer", "job_summary": "Builds APIs.",'

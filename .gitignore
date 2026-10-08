@@ -24,5 +24,8 @@ generated/
 # Usage ledger (internal billing data)
 backend/data/
 
+# Guard eval answers (re-scored offline; rerun to refresh)
+backend/evals/out/
+
 # MCP servers config (may contain tokens) — keep the .example, not the real one
 backend/mcp_servers.json

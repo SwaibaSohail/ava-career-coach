@@ -221,9 +221,10 @@ def check_input_llm(message: str) -> str:
             log.warning("guard: GUARD_BACKEND=%s needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN; "
                         "running the Groq guard instead", backend)
         backend = "groq"
-    if backend == "clef":
-        return _clef_decides(message)
-    label = _groq_guard(message)
+    with metering.feature("guard"):   # whoever answers: Clef, Groq or Clef's fallback
+        if backend == "clef":
+            return _clef_decides(message)
+        label = _groq_guard(message)
     if backend == "shadow":
         _submit_shadow(message, label)   # never waited on
     return label
@@ -232,7 +233,8 @@ def check_input_llm(message: str) -> str:
 def _groq_guard(message: str, *, timeout: float | None = None,
                 max_retries: int | None = None) -> str:
     """The Groq classifier on the guard's own budget (None = GUARD_TIMEOUT_S /
-    GUARD_MAX_RETRIES). Returns a label; fails OPEN to 'CLEAN'."""
+    GUARD_MAX_RETRIES), billed to the caller's metering feature. Returns a
+    label; fails OPEN to 'CLEAN'."""
     try:
         from llm import get_llm
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -243,10 +245,9 @@ def _groq_guard(message: str, *, timeout: float | None = None,
             timeout=config.GUARD_TIMEOUT_S if timeout is None else timeout,
             max_retries=config.GUARD_MAX_RETRIES if max_retries is None else max_retries,
         )
-        with metering.feature("guard"):
-            resp = llm.invoke(
-                [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
-            )
+        resp = llm.invoke(
+            [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
+        )
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         label = _parse_guard_label(content)
         if label is None:
@@ -376,8 +377,7 @@ def _clef_decides(message: str) -> str:
     """clef mode: Clef's label, or on a ClefError the fallback's (CLEF_FALLBACK)."""
     started = time.perf_counter()
     try:
-        with metering.feature("guard"):
-            label, probs, _ = clef_guard(message)
+        label, probs, _ = clef_guard(message)
     except clef.ClefError as error:
         _log_decision("clef", message, started, error=error.kind)
         if config.CLEF_FALLBACK == "open":
