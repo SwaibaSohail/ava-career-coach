@@ -183,28 +183,51 @@ _GUARD_SYSTEM = (
     "Reply with ONLY the single label word and nothing else."
 )
 
+# The reply must START with a label; "not INJECTION" or "no injection here"
+# must never block.
+_GUARD_LABEL_RE = re.compile(r"^\W*(CLEAN|INJECTION|ABUSE|HARMFUL)\b", re.IGNORECASE)
+
+
+def _parse_guard_label(text: str) -> str | None:
+    """The label the guard's reply opens with, upper-cased, or None."""
+    match = _GUARD_LABEL_RE.match(text or "")
+    return match.group(1).upper() if match else None
+
 
 def check_input_llm(message: str) -> str:
     """Cheap LLM safety classifier. Returns a label; fails OPEN to 'CLEAN'."""
     if not config.GUARD_LLM_ENABLED:
         return "CLEAN"
+    return _groq_guard(message)
+
+
+def _groq_guard(message: str, *, timeout: float | None = None,
+                max_retries: int | None = None) -> str:
+    """The Groq classifier on the guard's own budget (None = GUARD_TIMEOUT_S /
+    GUARD_MAX_RETRIES). Returns a label; fails OPEN to 'CLEAN'."""
     try:
         import metering
         from llm import get_llm
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = get_llm(temperature=0, model=config.GUARD_MODEL,
-                      reasoning_effort=config.GUARD_REASONING_EFFORT)
+        llm = get_llm(
+            temperature=0, model=config.GUARD_MODEL,
+            reasoning_effort=config.GUARD_REASONING_EFFORT,
+            timeout=config.GUARD_TIMEOUT_S if timeout is None else timeout,
+            max_retries=config.GUARD_MAX_RETRIES if max_retries is None else max_retries,
+        )
         with metering.feature("guard"):
             resp = llm.invoke(
                 [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
             )
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
-        upper = content.upper()
-        for label in ("INJECTION", "ABUSE", "HARMFUL"):
-            if label in upper:
-                return label
-        return "CLEAN"
+        label = _parse_guard_label(content)
+        if label is None:
+            # The reply may echo the message, so log only its length.
+            log.warning("guard model %s replied without a label (%d chars); "
+                        "skipping the LLM check", config.GUARD_MODEL, len(content))
+            return "CLEAN"
+        return label
     except Exception as exc:
         # Fail open: never block real users on an outage. Log the model and the
         # error (never the message) so a retired model or outage is visible.

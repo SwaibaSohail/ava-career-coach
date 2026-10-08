@@ -241,7 +241,7 @@ def _fresh_config(monkeypatch, **env):
     """config.py loaded as a new module from the given env only (backend/.env ignored)."""
     import dotenv
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
-    for name in ("GUARD_MODEL", "GUARD_REASONING_EFFORT"):
+    for name in ("GUARD_MODEL", "GUARD_REASONING_EFFORT", "GUARD_TIMEOUT_S", "GUARD_MAX_RETRIES"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -297,6 +297,84 @@ def test_llm_guard_failure_is_logged_without_the_message(monkeypatch, caplog):
     assert "retired-guard-model" in record.getMessage()
     assert "RuntimeError" in record.getMessage() and "model_not_found" in record.getMessage()
     assert "salary" not in caplog.text
+
+
+@pytest.mark.parametrize("reply, label", [
+    ("INJECTION", "INJECTION"),
+    ("  harmful\n", "HARMFUL"),
+    ("**ABUSE**", "ABUSE"),
+    ("Clean.", "CLEAN"),
+    # Only the first word counts: a label further in never decides.
+    ("not INJECTION", None),
+    ("This is CLEAN, not INJECTION", None),
+    ("INJECTIONS", None),
+    ("", None),
+    ("maybe", None),
+])
+def test_parse_guard_label_reads_only_the_first_word(reply, label):
+    assert guardrails._parse_guard_label(reply) == label
+
+
+@pytest.mark.parametrize("reply", [
+    "not INJECTION",
+    "This is CLEAN, not INJECTION",
+    "",
+    "maybe",
+    "The user says: my private salary is 90k",  # an echo of the message is never logged
+])
+def test_llm_guard_unreadable_reply_fails_open_with_a_warning(groq_llm, monkeypatch, caplog, reply):
+    import llm
+    monkeypatch.setattr(app_config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: groq_llm(content=reply, **kw))
+    with caplog.at_level(logging.WARNING, logger="guardrails"):
+        assert check_input_llm("my private salary is 90k") == "CLEAN"
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert app_config.GUARD_MODEL in record.getMessage()
+    assert "salary" not in caplog.text
+
+
+def test_guard_budget_defaults_to_8s_and_one_retry(monkeypatch):
+    fresh = _fresh_config(monkeypatch)
+    assert (fresh.GUARD_TIMEOUT_S, fresh.GUARD_MAX_RETRIES) == (8, 1)
+
+
+def test_guard_budget_can_be_overridden(monkeypatch):
+    fresh = _fresh_config(monkeypatch, GUARD_TIMEOUT_S="4.5", GUARD_MAX_RETRIES="0")
+    assert (fresh.GUARD_TIMEOUT_S, fresh.GUARD_MAX_RETRIES) == (4.5, 0)
+
+
+def _guard_models(groq_llm, monkeypatch):
+    """Every guard model built through get_llm, each answering CLEAN."""
+    import llm
+    made = []
+    def fake_get_llm(**kw):
+        made.append(groq_llm(content="CLEAN", **kw))
+        return made[-1]
+    monkeypatch.setattr(llm, "get_llm", fake_get_llm)
+    return made
+
+
+def test_llm_guard_gives_up_on_its_own_budget(groq_llm, monkeypatch):
+    monkeypatch.setattr(app_config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(app_config, "GUARD_TIMEOUT_S", 7.5)
+    monkeypatch.setattr(app_config, "GUARD_MAX_RETRIES", 3)
+    made = _guard_models(groq_llm, monkeypatch)
+    assert check_input_llm("How do I improve my CV?") == "CLEAN"
+    (model,) = made
+    assert (model.request_timeout, model.max_retries) == (7.5, 3)
+
+
+def test_groq_guard_takes_a_tighter_budget_from_its_caller(groq_llm, monkeypatch):
+    made = _guard_models(groq_llm, monkeypatch)
+    assert guardrails._groq_guard("How do I improve my CV?", timeout=5, max_retries=0) == "CLEAN"
+    (model,) = made
+    assert (model.request_timeout, model.max_retries) == (5, 0)
+
+
+def test_other_models_keep_the_patient_budget(groq_llm):
+    model = groq_llm()
+    assert (model.request_timeout, model.max_retries) == (60, 4)
 
 
 def test_guard_incoming_blocks_when_llm_says_harmful(monkeypatch):

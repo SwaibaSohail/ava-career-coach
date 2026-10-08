@@ -17,6 +17,10 @@ GUARD_MODEL = os.getenv("GUARD_MODEL", "openai/gpt-oss-20b")
 # output tokens. Leave it empty for a non-reasoning model so it is not sent.
 GUARD_REASONING_EFFORT = os.getenv("GUARD_REASONING_EFFORT", "low")
 GUARD_LLM_ENABLED = os.getenv("GUARD_LLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# The guard's own call budget (seconds per attempt, retries after the first):
+# it fails open, so it gives up well before the main chat's 60 s x 4 retries.
+GUARD_TIMEOUT_S = float(os.getenv("GUARD_TIMEOUT_S", "8"))
+GUARD_MAX_RETRIES = int(os.getenv("GUARD_MAX_RETRIES", "1"))
 
 # Max characters kept from an incoming chat message before it reaches the agent.
 # Generous enough to fit a pasted job description; still caps absurd payloads.
