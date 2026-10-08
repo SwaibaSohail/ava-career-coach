@@ -266,6 +266,10 @@ def _enqueue(provider: str, model: str, input_tokens: int, output_tokens: int, e
                   {"ctx": ctx or current(), "ts": _now()}))
 
 
+# For clients that record their own calls (clef.py), outside LangChain.
+enqueue = _enqueue
+
+
 def flush() -> None:
     """Block until every queued row is written (or has failed and been logged).
     For tests and shutdown; never call it on the event loop."""

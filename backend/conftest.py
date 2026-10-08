@@ -1,10 +1,13 @@
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import httpx
 import pytest
 
+import clef
 import config
 import metering
 
@@ -21,6 +24,89 @@ def _temp_usage_ledger(tmp_path, monkeypatch):
     yield
     # Rows still queued for the writer thread belong in this test's ledger.
     metering.flush()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_clef(monkeypatch):
+    """No test reaches Cloudflare: a Clef call fails the test unless clef_api
+    answers it. Credentials are test values and the daily-quota pause is off."""
+    def refuse(request):
+        raise AssertionError("live Clef call; use the clef_api fixture")
+
+    monkeypatch.setattr(clef, "_transport", httpx.MockTransport(refuse))
+    monkeypatch.setattr(config, "CLOUDFLARE_ACCOUNT_ID", "acct-test")
+    monkeypatch.setattr(config, "CLOUDFLARE_API_TOKEN", "tok-test")
+    monkeypatch.setattr(clef, "_quota_until", None)
+
+
+class FakeClef:
+    """Stands in for Cloudflare's Workers AI REST API: answers Clef calls as told,
+    records each request (url, headers, json body, timeout), no network.
+
+    Replies have the live-verified shape: {"result": {"model", "answers",
+    "usage"}, "success", "errors", "messages"}."""
+
+    def __init__(self):
+        self.requests = []
+        self.before = None   # optional callable(body), run before answering (a slow Clef)
+
+    # Answers shaped like the live API's.
+    @staticmethod
+    def noul(p):
+        return {"type": "noul", "noul": p}
+
+    @staticmethod
+    def choice(probabilities):
+        return {"type": "choice", "choice": max(probabilities, key=probabilities.get),
+                "probabilities": probabilities, "confidence": 0.8}
+
+    @staticmethod
+    def score(probabilities, legend):
+        return {"type": "score", "score": sum(i * p for i, p in enumerate(probabilities)),
+                "legend": {str(i): text for i, text in enumerate(legend)},
+                "probabilities": {str(i): p for i, p in enumerate(probabilities)}, "confidence": 0.5}
+
+    def reply(self, answers, input_tokens=346, envelope=True, request_id="req-test"):
+        """Succeed with these answers (or answers(body), when callable)."""
+        def respond(body):
+            result = {"model": body["model"], "answers": answers(body) if callable(answers) else answers,
+                      "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
+            payload = {"result": result, "success": True, "errors": [], "messages": []} if envelope else result
+            return httpx.Response(200, json=payload, headers={"cf-ai-req-id": request_id} if request_id else {})
+        self._respond = respond
+
+    def error(self, status, code=None, message="error"):
+        """Fail as Cloudflare does: a status and a v4 envelope with one error."""
+        payload = {"result": None, "success": False, "errors": [{"code": code, "message": message}],
+                   "messages": []}
+        self._respond = lambda body: httpx.Response(status, json=payload, headers={"cf-ai-req-id": "req-test"})
+
+    def raw(self, status, text):
+        self._respond = lambda body: httpx.Response(status, text=text)
+
+    def raise_(self, exc):
+        def respond(body):
+            raise exc
+        self._respond = respond
+
+    def _respond(self, body):
+        raise AssertionError("clef_api: set a reply first (reply, error, raw or raise_)")
+
+    def handle(self, request):
+        body = json.loads(request.content)
+        self.requests.append({"url": str(request.url), "headers": request.headers, "json": body,
+                              "timeout": request.extensions.get("timeout")})
+        if self.before is not None:
+            self.before(body)
+        return self._respond(body)
+
+
+@pytest.fixture
+def clef_api(monkeypatch):
+    """A fake Workers AI endpoint for clef.py (see FakeClef)."""
+    fake = FakeClef()
+    monkeypatch.setattr(clef, "_transport", httpx.MockTransport(fake.handle))
+    return fake
 
 
 class FakeGroqCompletions:

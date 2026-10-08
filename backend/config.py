@@ -66,6 +66,13 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 # false, chats without a key count under the uncapped built-in "default" client.
 REQUIRE_CLIENT_KEY = os.getenv("REQUIRE_CLIENT_KEY", "false").lower() in ("1", "true", "yes", "on")
 
+# Cloudflare Workers AI, for Clef (calibrated classification; see clef.py).
+# Nothing calls it unless both are set. A Clef call gets one attempt, no
+# retries, with this many seconds to answer.
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
+CLEF_TIMEOUT_S = float(os.getenv("CLEF_TIMEOUT_S", "3"))
+
 
 def is_api_key_configured() -> bool:
     return bool(GROQ_API_KEY) and GROQ_API_KEY != "your_groq_api_key_here"

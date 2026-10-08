@@ -20,5 +20,8 @@ fastembed>=0.8,<1
 langchain-tavily>=0.2,<1
 langchain-mcp-adapters>=0.1,<1
 
+# Cloudflare Clef client (httpx also comes with groq; pinned because clef.py uses it directly)
+httpx>=0.28,<1
+
 # Testing
 pytest>=9,<10
