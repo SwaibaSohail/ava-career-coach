@@ -73,6 +73,28 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 CLEF_TIMEOUT_S = float(os.getenv("CLEF_TIMEOUT_S", "3"))
 
+# Who runs the ingress guard's stage 5: "groq" (default), "clef" (Clef decides;
+# on a failure CLEF_FALLBACK runs) or "shadow" (Groq decides, Clef is asked in
+# the background and only logged). clef/shadow without the Cloudflare keys run
+# as groq. See guardrails.py and the README's "Clef guard" section.
+GUARD_BACKEND = os.getenv("GUARD_BACKEND", "groq").lower()
+CLEF_GUARD_MODEL = os.getenv("CLEF_GUARD_MODEL", "clef")             # clef | clef-flash
+CLEF_GUARD_RULE = os.getenv("CLEF_GUARD_RULE", "choice").lower()     # choice | noul
+CLEF_BLOCK_THRESHOLD = float(os.getenv("CLEF_BLOCK_THRESHOLD", "0.6"))
+# Longer messages are read as two windows: the first and last this many
+# characters (0 = always one window).
+CLEF_WINDOW_CHARS = int(os.getenv("CLEF_WINDOW_CHARS", "6000"))
+# When Clef fails: "groq" runs the Groq guard on this budget with no retries;
+# "open" skips the check (the regex and rule stages still apply).
+CLEF_FALLBACK = os.getenv("CLEF_FALLBACK", "groq").lower()
+CLEF_FALLBACK_TIMEOUT_S = float(os.getenv("CLEF_FALLBACK_TIMEOUT_S", "5"))
+# Decision log for Clef guard checks (resolved against backend/; never message
+# text). Shadow mode may keep the text of messages Clef and Groq disagree on,
+# for this many days, only while GUARD_SHADOW_STORE_TEXT is on (dev only).
+GUARD_LOG_DB = os.getenv("GUARD_LOG_DB", "data/guard.db")
+GUARD_SHADOW_STORE_TEXT = os.getenv("GUARD_SHADOW_STORE_TEXT", "false").lower() in ("1", "true", "yes", "on")
+GUARD_SHADOW_RETENTION_DAYS = int(os.getenv("GUARD_SHADOW_RETENTION_DAYS", "14"))
+
 
 def is_api_key_configured() -> bool:
     return bool(GROQ_API_KEY) and GROQ_API_KEY != "your_groq_api_key_here"

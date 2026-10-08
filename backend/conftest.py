@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -9,6 +10,7 @@ import pytest
 
 import clef
 import config
+import guardrails
 import metering
 
 
@@ -29,14 +31,40 @@ def _temp_usage_ledger(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_live_clef(monkeypatch):
     """No test reaches Cloudflare: a Clef call fails the test unless clef_api
-    answers it. Credentials are test values and the daily-quota pause is off."""
+    answers it. One made in the background, where the error may be caught (a
+    shadow guard check), fails the test at teardown. Credentials are test
+    values and the daily-quota pause is off."""
+    background = []
+
     def refuse(request):
+        if threading.current_thread() is not threading.main_thread():
+            background.append(threading.current_thread().name)
         raise AssertionError("live Clef call; use the clef_api fixture")
 
     monkeypatch.setattr(clef, "_transport", httpx.MockTransport(refuse))
     monkeypatch.setattr(config, "CLOUDFLARE_ACCOUNT_ID", "acct-test")
     monkeypatch.setattr(config, "CLOUDFLARE_API_TOKEN", "tok-test")
     monkeypatch.setattr(clef, "_quota_until", None)
+    yield
+    assert not background, f"live Clef call from {background}; use the clef_api fixture"
+
+
+@pytest.fixture(autouse=True)
+def _guard_on_groq(tmp_path, monkeypatch):
+    """The ingress guard runs as shipped (Groq, Clef settings at their defaults,
+    no shadow text) whatever backend/.env says, with a throwaway decision log.
+    Shadow checks a test started finish before the next test begins."""
+    for name, value in {
+        "GUARD_BACKEND": "groq", "CLEF_GUARD_MODEL": "clef", "CLEF_GUARD_RULE": "choice",
+        "CLEF_BLOCK_THRESHOLD": 0.6, "CLEF_WINDOW_CHARS": 6000, "CLEF_FALLBACK": "groq",
+        "CLEF_FALLBACK_TIMEOUT_S": 5.0, "GUARD_SHADOW_STORE_TEXT": False, "GUARD_SHADOW_RETENTION_DAYS": 14,
+        "GUARD_LOG_DB": str(tmp_path / "guard.db"),
+    }.items():
+        monkeypatch.setattr(config, name, value)
+    monkeypatch.setattr(guardrails, "_warned_no_clef", False)
+    monkeypatch.setattr(guardrails, "_last_error_at", {})
+    yield
+    guardrails._shadow_drain(10)
 
 
 class FakeClef:

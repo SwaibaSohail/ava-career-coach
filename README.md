@@ -90,7 +90,7 @@ often don't — paste the text in those cases. Each fetch call spawns the server
 
 Ava records every LLM call in a local SQLite ledger, `backend/data/usage.db`
 (gitignored), so clients can be billed by tokens or sold monthly allowances. Each
-row holds the time, client, chat session, feature (`chat`, `guard`, `interview.*`),
+row holds the time, client, chat session, feature (`chat`, `guard`, `guard.shadow`, `interview.*`),
 model, input/output tokens and an estimated cost — **never message text**. The chat
 session is stored as a one-way hash, because a session id on its own opens that
 chat. Users never see usage.
@@ -151,6 +151,102 @@ same totals from the command line, which also flags estimated and unpriced calls
 python manage_clients.py usage                       # current month
 python manage_clients.py usage --month 2026-09 --client <client_id>
 ```
+
+### Clef guard (optional)
+
+Every chat message goes through cheap checks first (length, a prompt-injection
+regex, abuse and spam rules). Only messages that pass reach stage 5, a model that
+classifies the message as clean, injection, abuse or harmful. By default that is
+a small Groq model (`GUARD_MODEL`) answering with one label. Stage 5 can instead
+run on Cloudflare's **Clef**, which returns a probability for each class rather
+than a label. Why:
+
+- **A threshold we can tune.** With a probability per class, how many real
+  messages get wrongly blocked is set from data (`CLEF_BLOCK_THRESHOLD`). A label
+  can't be tuned.
+- **A separate rate limit.** The guard stops sharing Groq's limit with the chat.
+- **Reuse.** `backend/clef.py` is a general decision client that Alfred can use
+  later (routing, lead scoring, handoff).
+
+**Modes** (`GUARD_BACKEND`):
+
+- `groq` (default): the Groq guard decides, as before.
+- `shadow`: Groq decides and its answer is used at once. Clef is asked the same
+  question in the background (two workers; skipped while 20 are waiting) and its
+  answer is only logged, so the two can be compared on real traffic. A reply is
+  never held up waiting for Clef.
+- `clef`: Clef decides.
+
+`shadow` and `clef` need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a
+Workers AI token: dashboard → AI → Workers AI → Use REST API). Without them the
+backend logs a warning once and runs as `groq`. The token is never logged and
+`/api/config` doesn't expose it.
+
+**How Clef decides.** One request asks four questions, versioned together as
+`guard-v1`: which of the four classes the message is (a choice), and a yes/no
+question for each bad class. With `CLEF_GUARD_RULE=choice` (the default), a
+message is blocked when the most likely bad class reaches `CLEF_BLOCK_THRESHOLD`
+(default 0.6), and that class is the label. With `noul`, the yes/no answers decide
+the same way. Ties go injection, then abuse, then harmful. Under `choice`, a
+message whose risk is split across classes (0.3 each) is not blocked, because no
+single class reaches the threshold. The rule and threshold are starting values;
+the offline side-by-side against Groq picks the real ones.
+
+**Long messages.** Clef may read only the start of a long text. A message longer
+than `CLEF_WINDOW_CHARS` (6,000) is checked as two windows, its first and last
+6,000 characters, sent in parallel. Each bad class takes the higher of its two
+probabilities, so a trigger in either window counts. Messages are capped at 8,000
+characters, so the two windows cover everything. `0` turns windows off.
+
+**When Clef fails** (a timeout, a server error, a rejected token, the daily
+allowance used up): with `CLEF_FALLBACK=groq` (the default), the Groq guard runs on
+a tight budget instead: `CLEF_FALLBACK_TIMEOUT_S` (5 s) and no retries. If that
+fails too, the check is skipped and the message goes through. The chain is Clef
+(3 s, `CLEF_TIMEOUT_S`) → Groq (5 s) → skip, so the guard waits about 8 s at most.
+In Groq-only mode it waits up to 8 s per attempt over 2 attempts. With
+`CLEF_FALLBACK=open`, a failed Clef check is skipped straight away (the regex and
+rule stages still apply).
+
+**Daily allowance.** Clef runs on Workers AI's free 10,000 Neurons a day, shared
+by everything on the Cloudflare account. Once they are used up, Clef isn't called
+again until they reset at **00:00 UTC (05:00 PKT)**. This is logged once at ERROR,
+and the fallback answers in the meantime. A rejected token is logged at ERROR at
+most every 5 minutes. Clef calls go into the usage ledger as provider `cloudflare`,
+feature `guard` (`guard.shadow` in shadow mode), one row per window.
+
+**Decision log.** Every Clef guard check writes one row to `backend/data/guard.db`
+(`GUARD_LOG_DB`, gitignored): the time, mode, question-set version, rule,
+threshold, model, number of windows, Clef's seven probabilities, Clef's label,
+Groq's label (in shadow mode), latency and the error kind, if any. It never holds
+the message. The rule and threshold can be re-tuned from these rows.
+
+**Shadow text (dev only).** With `GUARD_SHADOW_STORE_TEXT=true`, shadow mode also
+keeps the text of messages where Clef and Groq disagreed, so they can be read and
+labelled. These rows are deleted after `GUARD_SHADOW_RETENTION_DAYS` (14). The flag
+is off by default and should stay off in production, where shadow mode then gives
+agreement rates, not examples.
+
+**Privacy.** Messages already go to Groq for the guard. Clef adds Cloudflare as a
+second processor of the same text; Cloudflare states that it does not store
+Workers AI inputs or train on them. Disagreement text, when enabled, stays on our
+server.
+
+| Setting (`backend/.env`) | Default | |
+| ------------------------ | ------- | - |
+| `GUARD_BACKEND` | `groq` | `groq`, `shadow` or `clef` |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | empty | needed for `shadow` and `clef` |
+| `CLEF_GUARD_MODEL` | `clef` | or `clef-flash` (cheaper) |
+| `CLEF_GUARD_RULE` | `choice` | or `noul` |
+| `CLEF_BLOCK_THRESHOLD` | `0.6` | the probability that blocks |
+| `CLEF_WINDOW_CHARS` | `6000` | `0` = one window |
+| `CLEF_TIMEOUT_S` | `3` | seconds per Clef call, no retries |
+| `CLEF_FALLBACK` | `groq` | or `open` |
+| `CLEF_FALLBACK_TIMEOUT_S` | `5` | the Groq fallback's budget, no retries |
+| `GUARD_LOG_DB` | `data/guard.db` | resolved against `backend/` |
+| `GUARD_SHADOW_STORE_TEXT` | `false` | dev only |
+| `GUARD_SHADOW_RETENTION_DAYS` | `14` | |
+
+Restart the backend after changing them.
 
 ## API
 

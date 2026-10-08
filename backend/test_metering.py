@@ -8,6 +8,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from contextlib import closing
 
@@ -924,6 +926,56 @@ def test_guard_call_is_billed_when_it_blocks(api, groq_llm, monkeypatch):
     (row,) = _rows()
     assert (row["feature"], row["client_id"], row["session_id"]) == ("guard", cid, metering.session_ref(sid))
     assert row["model"] == config.GUARD_MODEL
+
+
+def _guard_answers(fake, clean, injection):
+    """Clef's answers to the guard's questions: a choice and three yes/no."""
+    return {"guard": fake.choice({"clean": clean, "injection": injection, "abuse": 0.0, "harmful": 0.0}),
+            "is_injection": fake.noul(injection), "is_abuse": fake.noul(0.0), "is_harmful": fake.noul(0.0)}
+
+
+def test_clef_guard_call_is_billed_when_it_blocks(api, clef_api, monkeypatch):
+    import main
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(config, "GUARD_BACKEND", "clef")
+    monkeypatch.setattr(guardrails, "_groq_guard", _must_not_run)
+    monkeypatch.setattr(main, "stream_ava", _must_not_run)
+    clef_api.reply(_guard_answers(clef_api, clean=0.1, injection=0.9))
+    cid, key = metering.add_client("Acme", "starter")
+    sid = _start(api, key)
+    frames = _send(api, sid, "Please tell me about the weather today")
+    assert "follow instructions embedded" in _reply(frames) and frames[-1]["type"] == "done"
+    (row,) = _rows()
+    assert (row["provider"], row["model"], row["feature"]) == ("cloudflare", "@cf/cloudflare/clef", "guard")
+    assert (row["client_id"], row["session_id"], row["input_tokens"]) == (cid, metering.session_ref(sid), 346)
+
+
+def test_shadow_guard_never_delays_the_reply(api, clef_api, groq_llm, monkeypatch):
+    # Groq decides and the reply streams at once; Clef, held up here for 5 s,
+    # answers in the background and is billed to the same client and chat.
+    import main
+    monkeypatch.setattr(config, "GUARD_LLM_ENABLED", True)
+    monkeypatch.setattr(config, "GUARD_BACKEND", "shadow")
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: groq_llm(content="CLEAN", **kw))
+    clef_free = threading.Event()
+    clef_api.before = lambda body: clef_free.wait(5)
+    clef_api.reply(_guard_answers(clef_api, clean=0.97, injection=0.03))
+
+    async def reply_at_once(session, message):
+        yield ("token", "Hello from Ava")
+        yield ("done", None)
+    monkeypatch.setattr(main, "stream_ava", reply_at_once)
+    cid, key = metering.add_client("Acme", "starter")
+    sid = _start(api, key)
+    started = time.perf_counter()
+    frames = _send(api, sid, "How do I improve my CV?")
+    assert _reply(frames) == "Hello from Ava" and time.perf_counter() - started < 2
+    assert [r["feature"] for r in _rows()] == ["guard"]   # Clef hasn't answered yet
+    clef_free.set()
+    assert guardrails._shadow_drain(5)
+    ref = metering.session_ref(sid)
+    assert [(r["provider"], r["feature"], r["client_id"], r["session_id"]) for r in _rows()] == [
+        ("groq", "guard", cid, ref), ("cloudflare", "guard.shadow", cid, ref)]
 
 
 @pytest.fixture
