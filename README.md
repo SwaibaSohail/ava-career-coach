@@ -188,17 +188,21 @@ rejected one.
 `guard-v1`: which of the four classes the message is (a choice), and a yes/no
 question for each bad class. With `CLEF_GUARD_RULE=choice` (the default), a
 message is blocked when the most likely bad class reaches `CLEF_BLOCK_THRESHOLD`
-(default 0.6), and that class is the label. With `noul`, the yes/no answers decide
+(default 0.4), and that class is the label. With `noul`, the yes/no answers decide
 the same way. Ties go injection, then abuse, then harmful. Under `choice`, a
 message whose risk is split across classes (0.3 each) is not blocked, because no
-single class reaches the threshold. The rule and threshold are starting values;
-the offline side-by-side against Groq picks the real ones.
+single class reaches the threshold. The rule and threshold were picked by the
+offline side-by-side against Groq on question set `guard-v1` (see
+[the results](docs/superpowers/specs/2026-10-09-clef-guard-eval-results.md));
+a new question-set version needs a new sweep before the threshold is trusted.
 
-**Long messages.** Clef may read only the start of a long text. A message longer
-than `CLEF_WINDOW_CHARS` (6,000) is checked as two windows, its first and last
-6,000 characters, sent in parallel. Each bad class takes the higher of its two
-probabilities, so a trigger in either window counts. Messages are capped at 8,000
-characters, so the two windows cover everything. `0` turns windows off.
+**Long messages.** By default (`CLEF_WINDOW_CHARS=0`) every message is sent to
+Clef whole: the cutoff probe caught a trigger at every position in a
+10,000-character CV, longer than Ava's 8,000-character cap. Should Workers AI
+start truncating the state, set `CLEF_WINDOW_CHARS` (for example 6000) and a
+message longer than that is checked as two windows, its first and last that many
+characters, sent in parallel; each bad class then takes the higher of its two
+probabilities, so a trigger in either window counts.
 
 **When Clef fails** (a timeout, a server error, a rejected token, the daily
 allowance used up): with `CLEF_FALLBACK=groq` (the default), the Groq guard runs on
@@ -250,8 +254,8 @@ server.
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | empty | needed for `shadow` and `clef` |
 | `CLEF_GUARD_MODEL` | `clef` | or `clef-flash` (cheaper) |
 | `CLEF_GUARD_RULE` | `choice` | or `noul` |
-| `CLEF_BLOCK_THRESHOLD` | `0.6` | the probability that blocks |
-| `CLEF_WINDOW_CHARS` | `6000` | `0` = one window |
+| `CLEF_BLOCK_THRESHOLD` | `0.4` | the probability that blocks (tuned for `guard-v1`, `choice`) |
+| `CLEF_WINDOW_CHARS` | `0` | one window; e.g. `6000` = first and last 6,000 characters |
 | `CLEF_TIMEOUT_S` | `3` | seconds for the whole Clef check, no retries |
 | `CLEF_FALLBACK` | `groq` | or `open` |
 | `CLEF_FALLBACK_TIMEOUT_S` | `5` | the Groq fallback's budget, no retries |
@@ -272,7 +276,7 @@ python -m evals.guard_eval cutoff                    # how much of a long messag
 python -m evals.guard_eval cutoff --lang ur          # the same with an Urdu-script CV
 python -m evals.guard_eval run --set dev --backends groq,clef,clef-flash
 python -m evals.guard_eval score --set dev --sweep   # pick the rule and threshold
-python -m evals.guard_eval score --set holdout --rule choice --threshold 0.6
+python -m evals.guard_eval score --set holdout --rule choice --threshold 0.4
 python -m evals.guard_eval disagreements --export unlabelled.jsonl
 ```
 
@@ -336,6 +340,16 @@ same rows. Each check prints `ok` or `FAIL` with both counts.
   provisional and never recommends the switch: the holdout is sorted by label, so
   the missing rows may be whole classes. These are counts on about 130 messages: a
   smoke test, not a benchmark.
+
+**Result so far (2026-10-09, `guard-v1`, `choice`, 0.4).** On the frozen holdout
+Clef passed but was not clearly not worse (74/75 caught against Groq's 71, one
+wrong block against Groq's none, p50 0.47 s against 2.7 s), so `groq` stays the
+default and the next step is shadow mode on real traffic. The full numbers, what
+each checker missed, the sweeps, the cutoff probes and the rule for ending the
+shadow phase are in
+[`docs/superpowers/specs/2026-10-09-clef-guard-eval-results.md`](docs/superpowers/specs/2026-10-09-clef-guard-eval-results.md).
+That rule is fixed before the first shadow call and is the only thing that moves
+the default.
 
 **disagreements** lists what shadow mode stored (only with
 `GUARD_SHADOW_STORE_TEXT=true`). `--export` writes them as set rows with `label`
