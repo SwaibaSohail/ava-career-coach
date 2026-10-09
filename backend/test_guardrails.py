@@ -963,6 +963,28 @@ def test_a_failed_window_fails_the_whole_clef_check(clef_api, monkeypatch):
     assert _decisions()[0]["error"] == "timeout"
 
 
+def test_a_window_that_fails_at_once_ends_the_check_without_waiting_for_a_slow_one(clef_api, monkeypatch):
+    _on(monkeypatch, "clef")
+    monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)
+    monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 2)
+    calls = _groq_calls(monkeypatch, "CLEAN")
+    release = threading.Event()
+    def answers(body):
+        if TRIGGER in body["state"]["message"]:
+            raise httpx.ConnectError("refused")   # the second window fails at once
+        release.wait(5)                           # the first is still under way
+        return _clef_answers(clef_api)
+    clef_api.reply(answers)
+    started = time.perf_counter()
+    try:
+        assert check_input_llm(_long_message()) == "CLEAN"
+        took = time.perf_counter() - started
+    finally:
+        release.set()
+    assert took < 1 and len(calls) == 1
+    assert _decisions()[0]["error"] == "server"   # the failure, not a timeout
+
+
 def test_a_used_up_allowance_is_logged_once_and_clef_is_not_asked_again(clef_api, monkeypatch, caplog):
     _on(monkeypatch, "clef")
     calls = _groq_calls(monkeypatch, "CLEAN")
@@ -1285,6 +1307,9 @@ def test_an_unexpected_shadow_failure_is_contained(monkeypatch, caplog):
     (record,) = [r for r in caplog.records if r.name == "guardrails"]
     assert record.levelno == logging.WARNING and "ValueError" in record.getMessage()
     assert "SENTINEL" not in caplog.text
+    # Logged like the same failure in clef mode, so the shadow rows count it.
+    (decision,) = _decisions()
+    assert (decision["mode"], decision["error"], decision["groq_label"]) == ("shadow", "unexpected", "CLEAN")
 
 
 # --- the decision log -------------------------------------------------------

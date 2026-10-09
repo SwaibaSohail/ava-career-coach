@@ -456,6 +456,9 @@ def _submit_shadow(message: str, groq_label: str | None) -> None:
             log.debug("guard: %d shadow checks pending; skipping this one", _shadow_pending)
             return
         _shadow_pending += 1
+    # submit raises only once the pool is shut down, i.e. at interpreter exit;
+    # the slot taken above is then never given back. Left as is on purpose: no
+    # request is guarded after that point.
     # In a copy of this context, so Clef's ledger row lands on the user's client and chat.
     _shadow_pool.submit(contextvars.copy_context().run, _shadow_call, message, groq_label)
 
@@ -481,6 +484,7 @@ def _shadow_call(message: str, groq_label: str | None) -> None:
     except Exception as exc:
         # Only the type: an unexpected error's text might quote the message.
         log.warning("guard: the shadow Clef check failed (%s)", type(exc).__name__)
+        _log_decision("shadow", message, started, groq_label=groq_label, error="unexpected")
     finally:
         guard_log.purge_old()
         with _shadow_idle:
