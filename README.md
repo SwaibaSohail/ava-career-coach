@@ -192,8 +192,9 @@ message is blocked when the most likely bad class reaches `CLEF_BLOCK_THRESHOLD`
 the same way. Ties go injection, then abuse, then harmful. Under `choice`, a
 message whose risk is split across classes (0.3 each) is not blocked, because no
 single class reaches the threshold. The rule and threshold were picked by the
-offline side-by-side against Groq on question set `guard-v1`; a new
-question-set version needs a new sweep before the threshold is trusted.
+offline side-by-side against Groq on question set `guard-v1` (see
+[the results](backend/evals/RESULTS.md)); a new question-set version needs a new
+sweep before the threshold is trusted.
 
 **Long messages.** By default (`CLEF_WINDOW_CHARS=0`) every message is sent to
 Clef whole: the cutoff probe caught a trigger at every position in a
@@ -340,10 +341,12 @@ same rows. Each check prints `ok` or `FAIL` with both counts.
   the missing rows may be whole classes. These are counts on about 130 messages: a
   smoke test, not a benchmark.
 
-**Result so far (2026-10-09, `guard-v1`, `choice`, 0.4).** On the frozen holdout
-Clef passed but was not clearly not worse (74/75 caught against Groq's 71, one
-wrong block against Groq's none, p50 0.47 s against 2.7 s), so `groq` stays the
-default and the next step is shadow mode on real traffic.
+**Result so far (2026-10-09, `guard-v1`, `choice`, 0.4).** On the frozen
+130-message holdout Clef passed but was not clearly not worse (68/69 caught against
+Groq's 65, one wrong block against Groq's none, p50 0.47 s against 2.7 s), so
+`groq` stays the default and the next step is shadow mode once real users arrive.
+The full numbers, what each checker missed, the long-message probes and the rule
+for ending the shadow phase are in [`backend/evals/RESULTS.md`](backend/evals/RESULTS.md).
 
 **disagreements** lists what shadow mode stored (only with
 `GUARD_SHADOW_STORE_TEXT=true`). `--export` writes them as set rows with `label`
