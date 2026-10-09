@@ -76,7 +76,7 @@ def _guard_on_groq(tmp_path, monkeypatch):
     test fails."""
     for name, value in {
         "GUARD_BACKEND": "groq", "CLEF_GUARD_MODEL": "clef", "CLEF_GUARD_RULE": "choice",
-        "CLEF_BLOCK_THRESHOLD": 0.6, "CLEF_WINDOW_CHARS": 6000, "CLEF_FALLBACK": "groq",
+        "CLEF_BLOCK_THRESHOLD": 0.4, "CLEF_WINDOW_CHARS": 0, "CLEF_FALLBACK": "groq",
         "CLEF_FALLBACK_TIMEOUT_S": 5.0, "GUARD_SHADOW_STORE_TEXT": False, "GUARD_SHADOW_RETENTION_DAYS": 14,
         "GUARD_LOG_DB": str(tmp_path / "guard.db"),
     }.items():

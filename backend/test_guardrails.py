@@ -529,7 +529,8 @@ def test_allowed_message_calls_agent_with_cleaned_text(monkeypatch):
 
 CLEF_GUARD_DEFAULTS = {
     "GUARD_BACKEND": "groq", "CLEF_GUARD_MODEL": "clef", "CLEF_GUARD_RULE": "choice",
-    "CLEF_BLOCK_THRESHOLD": 0.6, "CLEF_WINDOW_CHARS": 6000, "CLEF_FALLBACK": "groq",
+    # 0.4 and one window: what the 2026-10-09 side-by-side and cutoff probes settled on for guard-v1.
+    "CLEF_BLOCK_THRESHOLD": 0.4, "CLEF_WINDOW_CHARS": 0, "CLEF_FALLBACK": "groq",
     "CLEF_FALLBACK_TIMEOUT_S": 5, "GUARD_SHADOW_STORE_TEXT": False, "GUARD_SHADOW_RETENTION_DAYS": 14,
     "GUARD_LOG_DB": "data/guard.db",
 }
@@ -756,7 +757,7 @@ def test_an_unfaked_clef_call_fails_the_test_even_when_the_guard_falls_back(monk
 @pytest.mark.parametrize("settings, probs, label", [
     ({}, INJECTION_P, "INJECTION"),
     ({}, _p(clean=0.3, harmful=0.65, injection=0.03), "HARMFUL"),
-    ({}, _p(clean=0.41, injection=0.55), "CLEAN"),
+    ({}, _p(clean=0.57, injection=0.39), "CLEAN"),   # just under the shipped 0.4 threshold
     ({"CLEF_BLOCK_THRESHOLD": 0.95}, INJECTION_P, "CLEAN"),
     ({"CLEF_GUARD_RULE": "noul"}, _p(is_abuse=0.8), "ABUSE"),
     ({"CLEF_GUARD_RULE": "noul"}, _p(clean=0.41, injection=0.55, is_injection=0.2), "CLEAN"),
@@ -795,6 +796,7 @@ def test_clef_mode_can_use_clef_flash(clef_api, monkeypatch):
 def test_a_trigger_at_the_end_of_a_long_message_still_blocks(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     _groq_must_not_run(monkeypatch)
+    monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)   # the split is off by default
     clef_api.reply(_flags_the_trigger(clef_api))
     text = _long_message()
     assert len(text) <= app_config.MAX_MESSAGE_CHARS and TRIGGER not in text[:6000]
@@ -813,6 +815,7 @@ def test_a_trigger_at_the_end_of_a_long_message_still_blocks(clef_api, monkeypat
 def test_the_windows_are_asked_in_parallel(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     _groq_must_not_run(monkeypatch)
+    monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)
     both_asked = threading.Barrier(2)
     clef_api.before = lambda body: both_asked.wait(timeout=5)   # one at a time would break it
     clef_api.reply(_clef_answers(clef_api))
@@ -840,6 +843,7 @@ def test_a_clef_check_takes_clef_timeout_s_at_most_even_if_a_window_hangs(clef_a
 def test_long_messages_checked_at_once_never_queue_behind_each_other(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     _groq_must_not_run(monkeypatch)
+    monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)   # two windows each: the heavier case
     clef_api.before = lambda body: time.sleep(0.3)   # a healthy Clef, well inside CLEF_TIMEOUT_S
     clef_api.reply(_clef_answers(clef_api))
     text = _long_message().replace(TRIGGER, "Thanks")
@@ -872,6 +876,7 @@ def test_a_check_that_gives_up_never_sends_its_queued_windows(clef_api, monkeypa
 def test_clef_decisions_are_logged_without_the_message(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     _groq_must_not_run(monkeypatch)
+    monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)
     probs = {"clean": 0.3, "injection": 0.65, "abuse": 0.03, "harmful": 0.02,
              "is_injection": 0.7, "is_abuse": 0.02, "is_harmful": 0.01}
     clef_api.reply(_clef_answers(clef_api, probs))
@@ -880,7 +885,7 @@ def test_clef_decisions_are_logged_without_the_message(clef_api, monkeypatch):
     (row,) = _decisions()
     assert {k: row[k] for k in ("mode", "qset_version", "rule", "threshold", "model", "windows",
                                 "clef_label", "groq_label", "error")} == {
-        "mode": "clef", "qset_version": "guard-v1", "rule": "choice", "threshold": 0.6, "model": "clef",
+        "mode": "clef", "qset_version": "guard-v1", "rule": "choice", "threshold": 0.4, "model": "clef",
         "windows": 2, "clef_label": "INJECTION", "groq_label": None, "error": None}
     assert {name: row[f"p_{name}"] for name in PROBABILITIES} == probs
     assert row["latency_ms"] >= 0 and row["ts_utc"]
@@ -946,6 +951,7 @@ def test_clef_failures_from_the_api_fall_back_to_groq(clef_api, monkeypatch, fai
 
 def test_a_failed_window_fails_the_whole_clef_check(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
+    monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)
     calls = _groq_calls(monkeypatch, "CLEAN")
     def answers(body):
         if TRIGGER in body["state"]["message"]:

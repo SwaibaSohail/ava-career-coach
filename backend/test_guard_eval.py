@@ -357,7 +357,7 @@ def test_score_prints_the_report_and_the_acceptance_block(tmp_path, monkeypatch,
     path = _write_caches(tmp_path)
     assert main(["score", "--set", path, "--backends", "groq,clef"]) == 0
     out = capsys.readouterr().out
-    assert "Set mini: 8 of 8 rows scored" in out and "rule choice, threshold 0.60" in out
+    assert "Set mini: 8 of 8 rows scored" in out and "rule choice, threshold 0.40" in out
     assert "bad caught 3 of 4, missed 1; good wrongly blocked 1 of 4" in out
     assert "latency p50 400 ms, p95 3,000 ms, max 3,000 ms" in out
     assert "errors: timeout 1" in out and "errors: none" in out
@@ -378,7 +378,9 @@ PASSING = {"clef": {"c4": {"probabilities": CLEAN_P, "error": None, "input_token
 
 def test_score_can_pass_and_recommend_the_switch(tmp_path, monkeypatch, capsys):
     path = _write_caches(tmp_path, changes=PASSING)
-    assert main(["score", "--set", path, "--backends", "groq,clef", "--rule", "noul"]) == 0
+    # The threshold is passed in: at the shipped 0.4, a cached yes of exactly 0.4
+    # would block a clean row and this set would no longer clear the bar.
+    assert main(["score", "--set", path, "--backends", "groq,clef", "--rule", "noul", "--threshold", "0.6"]) == 0
     out = capsys.readouterr().out
     assert "clef: PASS" in out and "clearly not worse: YES" in out
     assert ("GUARD_BACKEND=clef, CLEF_GUARD_MODEL=clef, CLEF_GUARD_RULE=noul, CLEF_BLOCK_THRESHOLD=0.6"
@@ -431,6 +433,7 @@ def test_a_partly_scored_set_never_recommends_the_switch(tmp_path, capsys):
 # --- Running ----------------------------------------------------------------
 
 def test_run_caches_each_backends_answers_and_bills_eval_guard(clef_api, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "CLEF_WINDOW_CHARS", 6000)   # this test is about the two-window split
     groq_calls = _fake_groq(monkeypatch)
     clef_api.reply(_flags_the_trigger(clef_api))
     rows = [_row("c1"), _row("long", LONG, "injection", "en", "buried"),
@@ -490,6 +493,7 @@ def test_an_edited_row_or_another_model_is_asked_again(clef_api, monkeypatch, tm
 
 
 def test_a_new_window_size_or_groq_prompt_is_asked_again(clef_api, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "CLEF_WINDOW_CHARS", 6000)
     groq_calls = _fake_groq(monkeypatch)
     clef_api.reply(_flags_the_trigger(clef_api))
     rows = [_row("short"), _row("long", LONG, "injection", "en", "buried")]
@@ -516,6 +520,7 @@ def test_a_new_window_size_or_groq_prompt_is_asked_again(clef_api, monkeypatch, 
 
 
 def test_stage_5_sees_the_message_as_production_cuts_it(clef_api, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CLEF_WINDOW_CHARS", 6000)
     groq_calls = _fake_groq(monkeypatch)
     clef_api.reply(_flags_the_trigger(clef_api))
     text = "  " + FILLER * 130 + "  "   # over the 8,000-character cap
@@ -622,9 +627,10 @@ def test_a_groq_check_that_fails_open_is_recorded_as_an_error(groq_llm, monkeypa
 
 def test_the_estimate_counts_each_window_and_the_questions():
     assert guard_eval.estimate_neurons(["x" * 400], "clef") == pytest.approx(350 * 21_818 / 1e6)
-    # 8,000 characters are two windows of 6,000: 2 x (1,500 + 250) tokens.
-    assert guard_eval.estimate_neurons(["x" * 8000], "clef") == pytest.approx(3500 * 21_818 / 1e6)
-    assert guard_eval.estimate_neurons(["x" * 8000], "clef-flash") == pytest.approx(3500 * 8_182 / 1e6)
+    # The default is one window. With the split on, 8,000 characters are two
+    # windows of 6,000: 2 x (1,500 + 250) tokens.
+    assert guard_eval.estimate_neurons(["x" * 8000], "clef", window_chars=6000) == pytest.approx(3500 * 21_818 / 1e6)
+    assert guard_eval.estimate_neurons(["x" * 8000], "clef-flash", window_chars=6000) == pytest.approx(3500 * 8_182 / 1e6)
     assert guard_eval.estimate_neurons(["x" * 8000], "clef", window_chars=0) == pytest.approx(2250 * 21_818 / 1e6)
     assert guard_eval.estimate_neurons([], "clef") == 0
 
@@ -637,7 +643,8 @@ def test_more_than_80_percent_of_a_day_needs_yes(capsys):
     assert guard_eval.budget_ok(12_000, yes=True)
 
 
-def test_a_run_over_budget_asks_nothing_without_yes(clef_api, tmp_path, capsys):
+def test_a_run_over_budget_asks_nothing_without_yes(clef_api, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "CLEF_WINDOW_CHARS", 6000)   # two windows each, as the counts assume
     clef_api.reply(_answers(clef_api, CLEAN_P))
     # 105 messages near the 8,000-character cap: two windows each, ~8,018 Neurons on clef.
     path = _write_set(tmp_path, [_row(f"r{i}", LONG) for i in range(105)])
@@ -647,7 +654,8 @@ def test_a_run_over_budget_asks_nothing_without_yes(clef_api, tmp_path, capsys):
     assert clef_api.requests == [] and _cache("clef") == {}
 
 
-def test_both_clef_models_share_the_allowance(clef_api, tmp_path, capsys):
+def test_both_clef_models_share_the_allowance(clef_api, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "CLEF_WINDOW_CHARS", 6000)
     # Either model alone fits (77 x 76.4 = 5,880 Neurons on clef); together they don't.
     path = _write_set(tmp_path, [_row(f"r{i}", LONG) for i in range(77)])
     assert main(["run", "--set", path, "--backends", "clef,clef-flash"]) == 2

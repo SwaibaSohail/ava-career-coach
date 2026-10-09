@@ -81,10 +81,16 @@ CLEF_TIMEOUT_S = float(os.getenv("CLEF_TIMEOUT_S", "3"))
 GUARD_BACKEND = os.getenv("GUARD_BACKEND", "groq").lower()
 CLEF_GUARD_MODEL = os.getenv("CLEF_GUARD_MODEL", "clef")             # clef | clef-flash
 CLEF_GUARD_RULE = os.getenv("CLEF_GUARD_RULE", "choice").lower()     # choice | noul
-CLEF_BLOCK_THRESHOLD = float(os.getenv("CLEF_BLOCK_THRESHOLD", "0.6"))
-# Longer messages are read as two windows: the first and last this many
-# characters (0 = always one window).
-CLEF_WINDOW_CHARS = int(os.getenv("CLEF_WINDOW_CHARS", "6000"))
+# Tuned on the dev set for question set guard-v1 (choice rule) and held on the
+# holdout; see docs/superpowers/specs/2026-10-09-clef-guard-eval-results.md.
+# A new question-set version needs a new sweep before this is trusted.
+CLEF_BLOCK_THRESHOLD = float(os.getenv("CLEF_BLOCK_THRESHOLD", "0.4"))
+# Longer messages can be read as two windows: the first and last this many
+# characters. 0 (the default) reads every message as one window: the cutoff
+# probe showed Clef reading a 10,000-character message in full, in English and
+# Urdu script, and Ava caps messages at 8,000. Kept as a switch in case
+# Workers AI starts truncating the state again.
+CLEF_WINDOW_CHARS = int(os.getenv("CLEF_WINDOW_CHARS", "0"))
 # When Clef fails: "groq" runs the Groq guard on this budget with no retries;
 # "open" skips the check (the regex and rule stages still apply).
 CLEF_FALLBACK = os.getenv("CLEF_FALLBACK", "groq").lower()
