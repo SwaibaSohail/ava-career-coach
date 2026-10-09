@@ -213,7 +213,10 @@ check, `CLEF_TIMEOUT_S`) → Groq (5 s) → skip, so the guard waits about 8 s a
 most. In Groq-only mode it waits up to 8 s per attempt over 2 attempts, half a
 second apart; it never waits out a rate limit's `Retry-After`. Each limit is a
 deadline the guard keeps itself, however slowly an answer trickles in (httpx's
-own timeout applies to each read, not to the whole call). With
+own timeout applies to each read, not to the whole call). A call given up on
+keeps its thread until httpx gives up too, so Clef and Groq calls run on
+separate thread pools: Clef calls still stalled after their checks gave up can't
+hold up the Groq fallback, or in shadow mode the Groq check that decides. With
 `CLEF_FALLBACK=open`, a failed Clef check is skipped straight away (the regex and
 rule stages still apply).
 

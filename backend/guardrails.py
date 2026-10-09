@@ -204,18 +204,23 @@ def _parse_guard_label(text: str) -> str | None:
 
 _warned_no_clef = False
 
-# Every stage-5 call (a Groq attempt, a Clef window) runs on this pool, so the
-# guard can stop waiting at its own deadline: httpx applies its timeout to each
-# phase of a request (connect, each read), not to the whole call. Sized for
-# anyio's 40 request threads with two Clef windows each, so a check waits on
-# Groq or Clef, never on a free thread.
-_pool = ThreadPoolExecutor(max_workers=80, thread_name_prefix="guard-call")
+# Every stage-5 call (a Groq attempt, a Clef window) runs on one of these pools,
+# so the guard can stop waiting at its own deadline: httpx applies its timeout to
+# each phase of a request (connect, each read), not to the whole call. A call
+# given up on keeps its thread until httpx gives up too, so Clef and Groq get a
+# pool each: a stalled Clef can fill its own, never the Groq fallback's (or, in
+# shadow mode, the Groq check's). Sized for anyio's 40 request threads: two Clef
+# windows each; for Groq, a retry under way and the given-up attempt it replaced,
+# which may still hold its thread. The sizes match only because both come to two
+# per request; threads start as needed, so spare room costs nothing.
+_clef_pool = ThreadPoolExecutor(max_workers=80, thread_name_prefix="guard-clef")
+_groq_pool = ThreadPoolExecutor(max_workers=80, thread_name_prefix="guard-groq")
 
 
-def _submit(fn, *args):
+def _submit(pool, fn, *args):
     """fn(*args) on the pool, in a copy of this context, so its ledger row lands
     on the caller's client, session and feature."""
-    return _pool.submit(contextvars.copy_context().run, fn, *args)
+    return pool.submit(contextvars.copy_context().run, fn, *args)
 
 
 def _wait_at_most(seconds: float, future):
@@ -288,7 +293,7 @@ def _groq_label(message: str, *, timeout: float | None = None, max_retries: int 
         messages = [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
         for attempt in range(retries + 1):
             try:
-                resp = _wait_at_most(timeout, _submit(llm.invoke, messages))
+                resp = _wait_at_most(timeout, _submit(_groq_pool, llm.invoke, messages))
                 break
             except Exception as exc:
                 if attempt == retries or not _worth_retrying(exc):
@@ -376,7 +381,7 @@ def clef_guard(message: str, *, model: str | None = None) -> tuple[str, dict, li
     CLEF_TIMEOUT_S for the whole check, and each call is billed to the caller's
     metering feature. Raises clef.ClefError if any window fails or time runs out."""
     model = model or config.CLEF_GUARD_MODEL
-    futures = [_submit(_ask_clef, w, model) for w in guard_windows(message, config.CLEF_WINDOW_CHARS)]
+    futures = [_submit(_clef_pool, _ask_clef, w, model) for w in guard_windows(message, config.CLEF_WINDOW_CHARS)]
     done, pending = wait(futures, timeout=config.CLEF_TIMEOUT_S, return_when=FIRST_EXCEPTION)
     for future in pending:
         future.cancel()   # a window still queued is never sent; one under way finishes unread

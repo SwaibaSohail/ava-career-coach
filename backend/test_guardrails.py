@@ -901,6 +901,31 @@ def test_a_stalled_clef_under_load_never_costs_a_message_its_groq_fallback(clef_
     assert len(stalled) < 120   # windows queued behind stalled ones were never sent
 
 
+@pytest.mark.parametrize("backend", ["clef", "shadow"])
+def test_a_full_clef_pool_never_holds_up_groq(clef_api, monkeypatch, backend):
+    _on(monkeypatch, backend)
+    monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 0.2)
+    _groq_answers_on_the_pool(monkeypatch, "ABUSE")
+    clef_api.reply(_clef_answers(clef_api))
+    free = threading.Event()
+    for _ in range(guardrails._clef_pool._max_workers):
+        guardrails._clef_pool.submit(free.wait, 5)   # every Clef thread is taken
+    try:
+        started = time.perf_counter()
+        assert check_input_llm("How do I improve my CV?") == "ABUSE"
+        if backend == "shadow":   # Groq decides without waiting on Clef at all
+            assert time.perf_counter() - started < app_config.CLEF_TIMEOUT_S
+        # Shadow mode asks Clef only after replying, so the pool is held until
+        # that background check is done too: a test-ordering matter, so the check
+        # meets the full pool. It gives up within CLEF_TIMEOUT_S all the same.
+        started = time.perf_counter()
+        assert guardrails._shadow_drain(5) and time.perf_counter() - started < 1
+    finally:
+        free.set()
+    assert clef_api.requests == []   # Clef was queued, given up on and never sent
+    assert [d["error"] for d in _decisions()] == ["timeout"]
+
+
 def test_a_check_that_gives_up_never_sends_its_queued_windows(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 0.3)
@@ -908,7 +933,7 @@ def test_a_check_that_gives_up_never_sends_its_queued_windows(clef_api, monkeypa
     clef_api.reply(_clef_answers(clef_api))
     busy, free = ThreadPoolExecutor(max_workers=1), threading.Event()
     busy.submit(free.wait, 5)   # every worker is taken
-    monkeypatch.setattr(guardrails, "_pool", busy)
+    monkeypatch.setattr(guardrails, "_clef_pool", busy)
     try:
         assert check_input_llm(_long_message()) == "CLEAN"
     finally:
