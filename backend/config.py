@@ -82,7 +82,7 @@ GUARD_BACKEND = os.getenv("GUARD_BACKEND", "groq").lower()
 CLEF_GUARD_MODEL = os.getenv("CLEF_GUARD_MODEL", "clef")             # clef | clef-flash
 CLEF_GUARD_RULE = os.getenv("CLEF_GUARD_RULE", "choice").lower()     # choice | noul
 # Tuned on the dev set for question set guard-v1 (choice rule) and held on the
-# holdout; see docs/superpowers/specs/2026-10-09-clef-guard-eval-results.md.
+# holdout (python -m evals.guard_eval score --set dev --sweep re-runs the sweep).
 # A new question-set version needs a new sweep before this is trusted.
 CLEF_BLOCK_THRESHOLD = float(os.getenv("CLEF_BLOCK_THRESHOLD", "0.4"))
 # Longer messages can be read as two windows: the first and last this many
