@@ -8,14 +8,17 @@ threshold can be re-tuned from real traffic without keeping what people wrote.
 
 The only text kept is shadow mode's, and only with GUARD_SHADOW_STORE_TEXT on (a
 dev flag): messages where Clef and Groq disagreed, deleted after
-GUARD_SHADOW_RETENTION_DAYS.
+GUARD_SHADOW_RETENTION_DAYS (the backend purges at startup and every hour, and
+before listing them) and overwritten on disk, not just unlinked.
 
-Writes never raise into the guard: a failure is logged as a warning and the row
-is dropped.
+Writes are queued for one writer thread and never raise into the guard: a
+failure is logged as a warning and the row is dropped.
 """
 
+import atexit
 import logging
 import os
+import queue
 import sqlite3
 import threading
 from contextlib import closing
@@ -26,7 +29,7 @@ import config
 log = logging.getLogger(__name__)
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_BUSY_TIMEOUT_S = 2   # a locked log must not hold up the guard for long
+_BUSY_TIMEOUT_S = 2   # how long the writer (or a purge) waits on a locked log before giving up
 
 # Clef's answers for one message: the choice over the four classes, then the
 # three yes/no questions. Stored as p_<name>.
@@ -50,9 +53,9 @@ CREATE TABLE IF NOT EXISTS guard_decisions (
     p_is_abuse     REAL,
     p_is_harmful   REAL,
     clef_label     TEXT,
-    groq_label     TEXT,              -- shadow mode: the label the user got
+    groq_label     TEXT,              -- shadow mode: Groq's label; NULL when Groq failed (the user got CLEAN)
     latency_ms     REAL,
-    error          TEXT               -- the ClefError kind, when Clef failed
+    error          TEXT               -- the ClefError kind (or "unexpected"), when Clef failed
 );
 CREATE TABLE IF NOT EXISTS guard_disagreements (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,9 +92,8 @@ def _db_path() -> str:
     return path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
 
 
-def _connect() -> sqlite3.Connection:
+def _connect(path: str) -> sqlite3.Connection:
     """A fresh connection per call (safe across threads), schema ensured once per path."""
-    path = _db_path()
     with _init_lock:
         if path not in _initialized:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -101,13 +103,54 @@ def _connect() -> sqlite3.Connection:
             _initialized.add(path)
     conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
+    # Deleted rows are overwritten, not left readable in free pages.
+    conn.execute("PRAGMA secure_delete=ON")
     return conn
 
 
-def _insert(table: str, row: dict) -> None:
-    with closing(_connect()) as conn, conn:
+def _insert(path: str, table: str, row: dict) -> None:
+    with closing(_connect(path)) as conn, conn:
         conn.execute(f"INSERT INTO {table} ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
                      list(row.values()))
+
+
+# Rows go through one writer thread: a clef-mode check logs its decision before
+# the reply starts, and must never wait on SQLite for it (a locked log would hold
+# up the reply for the busy timeout); one writer also means our own rows never
+# contend for the write lock.
+_pending: queue.Queue = queue.Queue()
+_writer: threading.Thread | None = None
+_writer_lock = threading.Lock()
+_NOUNS = {"guard_decisions": "decision", "guard_disagreements": "disagreement"}
+
+
+def _write_pending() -> None:
+    while True:
+        path, table, row = _pending.get()
+        try:
+            _insert(path, table, row)
+        except Exception as exc:
+            log.warning("guard log: could not record a %s (%s: %s)", _NOUNS[table], type(exc).__name__, exc)
+        finally:
+            _pending.task_done()
+
+
+def _enqueue(table: str, row: dict) -> None:
+    """Queue one row for the writer, for the log GUARD_LOG_DB names now. Returns at once."""
+    global _writer
+    with _writer_lock:
+        if _writer is None:
+            _writer = threading.Thread(target=_write_pending, name="guard-log-writer", daemon=True)
+            _writer.start()
+    _pending.put((_db_path(), table, row))
+
+
+def flush() -> None:
+    """Block until every queued row is written (or has failed and been logged)."""
+    _pending.join()
+
+
+atexit.register(flush)
 
 
 def _probability_columns(probabilities: dict | None) -> dict:
@@ -116,9 +159,9 @@ def _probability_columns(probabilities: dict | None) -> dict:
 
 def record_decision(*, mode, qset_version, rule, threshold, model, windows, probabilities=None,
                     clef_label=None, groq_label=None, latency_ms=None, error=None) -> None:
-    """Log one Clef guard check (no text). Never raises."""
+    """Log one Clef guard check (no text). Queued; never raises."""
     try:
-        _insert("guard_decisions", {
+        _enqueue("guard_decisions", {
             "ts_utc": _iso(_utcnow()), "mode": mode, "qset_version": qset_version, "rule": rule,
             "threshold": threshold, "model": model, "windows": windows, **_probability_columns(probabilities),
             "clef_label": clef_label, "groq_label": groq_label, "latency_ms": latency_ms, "error": error,
@@ -129,9 +172,9 @@ def record_decision(*, mode, qset_version, rule, threshold, model, windows, prob
 
 def record_disagreement(*, qset_version, model, groq_label, clef_label, probabilities, message) -> None:
     """Keep a message Clef and Groq labelled differently, with its text (shadow
-    mode with GUARD_SHADOW_STORE_TEXT on). Never raises."""
+    mode with GUARD_SHADOW_STORE_TEXT on). Queued; never raises."""
     try:
-        _insert("guard_disagreements", {
+        _enqueue("guard_disagreements", {
             "ts_utc": _iso(_utcnow()), "qset_version": qset_version, "model": model,
             "groq_label": groq_label, "clef_label": clef_label, **_probability_columns(probabilities),
             "message": message,
@@ -141,8 +184,11 @@ def record_disagreement(*, qset_version, model, groq_label, clef_label, probabil
 
 
 def recent_disagreements(limit: int = 50) -> list[dict]:
-    """The stored disagreements, newest first, text included."""
-    with closing(_connect()) as conn:
+    """The stored disagreements still inside the retention period, newest first,
+    text included."""
+    flush()
+    purge_old()
+    with closing(_connect(_db_path())) as conn:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM guard_disagreements ORDER BY id DESC LIMIT ?", (limit,))]
 
@@ -150,10 +196,19 @@ def recent_disagreements(limit: int = 50) -> list[dict]:
 def purge_old() -> int:
     """Delete disagreements older than GUARD_SHADOW_RETENTION_DAYS; returns how
     many went. Never raises."""
+    path = _db_path()
+    if not os.path.exists(path):
+        return 0   # nothing was ever logged
     cutoff = _iso(_utcnow() - timedelta(days=config.GUARD_SHADOW_RETENTION_DAYS))
     try:
-        with closing(_connect()) as conn, conn:
-            return conn.execute("DELETE FROM guard_disagreements WHERE ts_utc < ?", (cutoff,)).rowcount
+        with closing(_connect(path)) as conn:
+            with conn:
+                gone = conn.execute("DELETE FROM guard_disagreements WHERE ts_utc < ?", (cutoff,)).rowcount
+            if gone:
+                # secure_delete zeroed the freed pages in the WAL; this writes them
+                # over the database file and empties the WAL, which still held the text.
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return gone
     except Exception as exc:
         log.warning("guard log: could not purge old disagreements (%s: %s)", type(exc).__name__, exc)
         return 0

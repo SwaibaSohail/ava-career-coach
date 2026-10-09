@@ -10,6 +10,7 @@ import pytest
 
 import clef
 import config
+import guard_log
 import guardrails
 import metering
 
@@ -28,32 +29,51 @@ def _temp_usage_ledger(tmp_path, monkeypatch):
     metering.flush()
 
 
+_live_clef_calls = []   # the threads that tried to reach Cloudflare
+
+
+def _refuse_clef(request):
+    _live_clef_calls.append(threading.current_thread().name)
+    raise AssertionError("live Clef call; use the clef_api fixture")
+
+
+_REFUSE_CLEF = httpx.MockTransport(_refuse_clef)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _safe_after_every_test(tmp_path_factory):
+    """What every test's monkeypatches are undone to, for the whole run: a
+    shadow check a test leaves queued can run after that test ends (at the
+    latest as the interpreter exits), and it must still be refused, carry no
+    real token and write to no real ledger. Never restored to backend/.env's."""
+    scratch = tmp_path_factory.mktemp("after-tests")
+    clef._transport = _REFUSE_CLEF
+    config.CLOUDFLARE_ACCOUNT_ID, config.CLOUDFLARE_API_TOKEN = "acct-test", "tok-test"
+    config.METERING_DB, config.GUARD_LOG_DB = str(scratch / "usage.db"), str(scratch / "guard.db")
+
+
 @pytest.fixture(autouse=True)
-def _no_live_clef(monkeypatch):
-    """No test reaches Cloudflare: a Clef call fails the test unless clef_api
-    answers it. One made in the background, where the error may be caught (a
-    shadow guard check), fails the test at teardown. Credentials are test
-    values and the daily-quota pause is off."""
-    background = []
-
-    def refuse(request):
-        if threading.current_thread() is not threading.main_thread():
-            background.append(threading.current_thread().name)
-        raise AssertionError("live Clef call; use the clef_api fixture")
-
-    monkeypatch.setattr(clef, "_transport", httpx.MockTransport(refuse))
+def live_clef_calls(monkeypatch):
+    """No test reaches Cloudflare: a Clef call nobody faked is refused and fails
+    the test, even when a fallback swallows the error (clef mode falls back to
+    Groq) or it ran in the background (a shadow check). Credentials are test
+    values and the daily-quota pause is off. A test that makes such a call on
+    purpose checks this list and empties it."""
+    _live_clef_calls.clear()
+    monkeypatch.setattr(clef, "_transport", _REFUSE_CLEF)
     monkeypatch.setattr(config, "CLOUDFLARE_ACCOUNT_ID", "acct-test")
     monkeypatch.setattr(config, "CLOUDFLARE_API_TOKEN", "tok-test")
     monkeypatch.setattr(clef, "_quota_until", None)
-    yield
-    assert not background, f"live Clef call from {background}; use the clef_api fixture"
+    yield _live_clef_calls
+    assert not _live_clef_calls, f"live Clef call from {_live_clef_calls}; use the clef_api fixture"
 
 
 @pytest.fixture(autouse=True)
 def _guard_on_groq(tmp_path, monkeypatch):
     """The ingress guard runs as shipped (Groq, Clef settings at their defaults,
     no shadow text) whatever backend/.env says, with a throwaway decision log.
-    Shadow checks a test started finish before the next test begins."""
+    Shadow checks a test started finish before the next test begins, or the
+    test fails."""
     for name, value in {
         "GUARD_BACKEND": "groq", "CLEF_GUARD_MODEL": "clef", "CLEF_GUARD_RULE": "choice",
         "CLEF_BLOCK_THRESHOLD": 0.6, "CLEF_WINDOW_CHARS": 6000, "CLEF_FALLBACK": "groq",
@@ -64,7 +84,9 @@ def _guard_on_groq(tmp_path, monkeypatch):
     monkeypatch.setattr(guardrails, "_warned_no_clef", False)
     monkeypatch.setattr(guardrails, "_last_error_at", {})
     yield
-    guardrails._shadow_drain(10)
+    drained = guardrails._shadow_drain(10)
+    guard_log.flush()   # rows still queued belong in this test's log
+    assert drained, "shadow checks still running after the test; release what the fake Clef waits on"
 
 
 class FakeClef:

@@ -19,6 +19,7 @@ GUARD_REASONING_EFFORT = os.getenv("GUARD_REASONING_EFFORT", "low")
 GUARD_LLM_ENABLED = os.getenv("GUARD_LLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # The guard's own call budget (seconds per attempt, retries after the first):
 # it fails open, so it gives up well before the main chat's 60 s x 4 retries.
+# Retries come half a second apart, never after the wait a rate limit asks for.
 GUARD_TIMEOUT_S = float(os.getenv("GUARD_TIMEOUT_S", "8"))
 GUARD_MAX_RETRIES = int(os.getenv("GUARD_MAX_RETRIES", "1"))
 
@@ -68,7 +69,7 @@ REQUIRE_CLIENT_KEY = os.getenv("REQUIRE_CLIENT_KEY", "false").lower() in ("1", "
 
 # Cloudflare Workers AI, for Clef (calibrated classification; see clef.py).
 # Nothing calls it unless both are set. A Clef call gets one attempt, no
-# retries, with this many seconds to answer.
+# retries, with this many seconds to answer (the guard: for all its windows).
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 CLEF_TIMEOUT_S = float(os.getenv("CLEF_TIMEOUT_S", "3"))

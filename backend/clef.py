@@ -5,16 +5,21 @@ callers. You pass a state (the text, or any JSON) and named questions: noul
 (P(yes)), choice (one of N options) or score (a level on a scale). You get back
 probabilities. Thresholds and fallbacks belong to the caller.
 
-One attempt per call, no retries, and a hard timeout (CLEF_TIMEOUT_S), so a
-slow Clef costs the caller seconds, not minutes. A failure raises ClefError
-with a kind the caller can act on. Each failed request is logged once with the
-model, kind, HTTP status, Cloudflare code, request id and time. The state and
-the token are never logged.
+One attempt per call, no retries, and a timeout (CLEF_TIMEOUT_S), so a slow
+Clef costs the caller seconds, not minutes. adecide holds the whole call to it;
+decide passes it to httpx, which applies it to each phase of the request
+(connect, send, each read), so a caller that needs a total bound waits with its
+own deadline (the guard does). A failure raises ClefError with a kind the
+caller can act on. Each failed request is logged once with the model, kind,
+HTTP status, Cloudflare code, request id and time. The state and the token are
+never logged.
 
 The free 10,000 Neurons a day are shared by all Workers AI use on the account.
 Once they run out (HTTP 429, code 3036), Clef is not called again until they
 reset at 00:00 UTC (05:00 in Pakistan). That is logged once at ERROR, so a used-up
-allowance never reads as a flaky Clef.
+allowance never reads as a flaky Clef. Just after 00:00 a used-up answer means
+Cloudflare hasn't reset yet (its clock and ours differ by seconds, or the call
+was sent before midnight), so Clef is tried again a minute later instead.
 
 Successful calls are metered (provider "cloudflare", the Workers AI model id,
 feature from the caller's context). Failed calls are not, as with Groq.
@@ -39,6 +44,9 @@ MODELS = {"clef": "@cf/cloudflare/clef", "clef-flash": "@cf/cloudflare/clef-flas
 URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model_id}"
 
 _ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+# What the credentials can be made of: an account id goes into the URL path, a
+# token into a header, which takes visible ASCII only.
+_ACCOUNT_RE, _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+"), re.compile(r"[\x21-\x7e]+")
 _MAX_QUESTIONS = 64
 _CHOICE_OPTIONS = (2, 255)
 _SCORE_LEVELS = (2, 10)
@@ -260,6 +268,8 @@ def parse(payload: dict, questions: dict) -> tuple[dict, int, int]:
 
 _quota_lock = threading.Lock()
 _quota_until: datetime | None = None
+_RESET_GRACE = timedelta(minutes=10)   # how late after 00:00 Cloudflare's reset may still be pending
+_RESET_RETRY = timedelta(minutes=1)
 
 
 def _utcnow() -> datetime:
@@ -267,8 +277,8 @@ def _utcnow() -> datetime:
 
 
 def quota_exhausted_until() -> datetime | None:
-    """When the used-up free allowance resets (the next 00:00 UTC), or None
-    while Clef may be called."""
+    """When Clef may be called again after the free allowance ran out (the next
+    00:00 UTC; a minute later, just after a reset), or None while it may be."""
     global _quota_until
     with _quota_lock:
         if _quota_until is not None and _utcnow() >= _quota_until:
@@ -280,11 +290,17 @@ def _pause_for_quota(model_id, error, request_id) -> None:
     """Stop calling Clef until the allowance resets; logged by the first caller only."""
     global _quota_until
     now = _utcnow()
-    reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    resetting = now - midnight < _RESET_GRACE   # Cloudflare may not have reset yet
+    reset = now + _RESET_RETRY if resetting else midnight + timedelta(days=1)
     with _quota_lock:
         if _quota_until is not None and now < _quota_until:
             return
         _quota_until = reset
+    if resetting:
+        log.warning("clef: the free daily Workers AI allowance still reads as used up just after its 00:00 UTC "
+                    "reset (%s, request %s); trying Clef again at %s UTC", model_id, request_id, f"{reset:%H:%M:%S}")
+        return
     log.error("clef: the account's free daily Workers AI allowance is used up (%s, HTTP %s, code %s, "
               "request %s); not calling Clef until it resets at %s UTC (05:00 PKT)",
               model_id, error.status, error.code, request_id, f"{reset:%Y-%m-%d %H:%M}")
@@ -323,6 +339,13 @@ def _prepare(model, state, questions) -> tuple[str, dict, dict, float]:
     body = build_body(model, state, questions)
     if not is_configured():
         raise ClefError("config", "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must both be set")
+    # Pasted with a stray space, quote or zero-width character, a credential
+    # can't go into the request; say which one (never its value).
+    for name, value, allowed in (("CLOUDFLARE_ACCOUNT_ID", config.CLOUDFLARE_ACCOUNT_ID, _ACCOUNT_RE),
+                                 ("CLOUDFLARE_API_TOKEN", config.CLOUDFLARE_API_TOKEN, _TOKEN_RE)):
+        if not allowed.fullmatch(value):
+            raise ClefError("config", f"{name} has characters it can't contain (a space, a quote, an invisible "
+                                      "character?); copy it again")
     until = quota_exhausted_until()
     if until is not None:
         raise ClefError("quota", f"the free daily allowance is used up; Clef is paused until "
@@ -343,7 +366,7 @@ def _failed(model, error, started, request_id=None) -> ClefError:
 
 
 def _transport_failed(model, exc, started) -> ClefError:
-    kind = "timeout" if isinstance(exc, httpx.TimeoutException) else "server"
+    kind = "timeout" if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)) else "server"
     return _failed(model, ClefError(kind, type(exc).__name__), started)
 
 
@@ -376,7 +399,8 @@ def decide(state, questions: dict, *, model: str = "clef", feature: str | None =
            timeout: float | None = None) -> Decision:
     """Ask Clef the questions about the state. Blocking: call it off the event
     loop. feature, when given, attributes the call in the ledger; timeout
-    defaults to CLEF_TIMEOUT_S. Raises ClefError."""
+    (default CLEF_TIMEOUT_S) applies to each phase of the request, not the whole
+    call. Raises ClefError."""
     url, body, headers, started = _prepare(model, state, questions)
     try:
         response = _client().post(url, json=body, headers=headers, timeout=timeout or config.CLEF_TIMEOUT_S)
@@ -387,10 +411,11 @@ def decide(state, questions: dict, *, model: str = "clef", feature: str | None =
 
 async def adecide(state, questions: dict, *, model: str = "clef", feature: str | None = None,
                   timeout: float | None = None) -> Decision:
-    """decide, for async callers."""
+    """decide, for async callers, with timeout bounding the whole call."""
     url, body, headers, started = _prepare(model, state, questions)
+    limit = timeout or config.CLEF_TIMEOUT_S
     try:
-        response = await _aclient().post(url, json=body, headers=headers, timeout=timeout or config.CLEF_TIMEOUT_S)
-    except httpx.HTTPError as exc:
+        response = await asyncio.wait_for(_aclient().post(url, json=body, headers=headers, timeout=limit), limit)
+    except (httpx.HTTPError, asyncio.TimeoutError) as exc:
         raise _transport_failed(model, exc, started) from exc
     return _finish(model, questions, response, started, feature)

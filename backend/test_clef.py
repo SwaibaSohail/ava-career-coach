@@ -6,8 +6,10 @@ import asyncio
 import copy
 import importlib.util
 import logging
+import os
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -168,9 +170,31 @@ def test_request_id_is_optional(clef_api):
     assert clef.decide(STATE, QUESTIONS).request_id is None
 
 
-def test_a_call_without_the_fake_fails_loudly():
+def test_a_call_without_the_fake_fails_loudly(live_clef_calls):
     with pytest.raises(AssertionError, match="live Clef call"):
         clef.decide(STATE, QUESTIONS)
+    assert live_clef_calls == ["MainThread"]   # on record too, for a caller that swallows the error
+    live_clef_calls.clear()   # made on purpose here; in any other test it fails at teardown
+
+
+def test_a_call_made_after_its_test_ended_is_still_refused(monkeypatch, live_clef_calls):
+    # A shadow check still queued when its test ends runs with the test's
+    # monkeypatches undone (at the latest as the interpreter exits). It must
+    # still be refused, carry no real token and write to no real ledger.
+    monkeypatch.undo()
+    hosts = []
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request",
+                        lambda transport, request: hosts.append(request.url.host) or httpx.Response(503))
+    with pytest.raises((AssertionError, clef.ClefError)):
+        clef.decide(STATE, QUESTIONS)
+    # Compared outside the assert, so a failure can never print a real key.
+    test_credentials = (config.CLOUDFLARE_ACCOUNT_ID, config.CLOUDFLARE_API_TOKEN) == ("acct-test", "tok-test")
+    assert hosts == [] and test_credentials
+    backend = os.path.dirname(os.path.abspath(config.__file__))
+    for path in (config.METERING_DB, config.GUARD_LOG_DB):
+        assert not os.path.abspath(os.path.join(backend, path)).startswith(os.path.join(backend, "data") + os.sep)
+    assert live_clef_calls == ["MainThread"]
+    live_clef_calls.clear()
 
 
 # --- Local limits ---------------------------------------------------------
@@ -341,6 +365,19 @@ def test_missing_credentials_fail_without_a_request(clef_api, monkeypatch, missi
     assert clef_api.requests == []
 
 
+@pytest.mark.parametrize("setting, value", [
+    ("CLOUDFLARE_API_TOKEN", "tok-test​"),        # a zero-width space, copied from a web page
+    ("CLOUDFLARE_API_TOKEN", "“tok-test”"),  # curly quotes
+    ("CLOUDFLARE_API_TOKEN", "tok test"),
+    ("CLOUDFLARE_ACCOUNT_ID", "acct-test/"),
+], ids=["zero-width space", "curly quotes", "a space", "a slash in the account"])
+def test_credentials_pasted_with_stray_characters_fail_without_a_request(clef_api, monkeypatch, setting, value):
+    clef_api.reply(_answers(clef_api))
+    monkeypatch.setattr(config, setting, value)
+    error = _fails("config", STATE, QUESTIONS)
+    assert clef_api.requests == [] and setting in str(error) and value not in str(error)
+
+
 def _fresh_config(monkeypatch, **env):
     """config.py loaded as a new module from the given env only (backend/.env ignored)."""
     import dotenv
@@ -394,6 +431,34 @@ def test_a_used_up_quota_pauses_clef_until_midnight_utc(clef_api, monkeypatch, c
     clef_api.reply(_answers(clef_api))
     clef.decide(STATE, QUESTIONS)
     assert len(clef_api.requests) == 2
+
+
+def test_a_used_up_quota_just_after_midnight_pauses_clef_briefly(clef_api, monkeypatch):
+    # Our clock may run ahead of Cloudflare's, or an answer sent before 00:00 may
+    # arrive after it: the allowance then resets seconds later, not a day later.
+    now = [datetime(2026, 10, 8, 23, 59, 58, tzinfo=timezone.utc)]
+    monkeypatch.setattr(clef, "_utcnow", lambda: now[0])
+    clef_api.error(429, 3036)
+    _fails("quota", STATE, QUESTIONS)
+    assert clef.quota_exhausted_until() == datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+    now[0] = datetime(2026, 10, 9, 0, 0, 1, tzinfo=timezone.utc)
+    _fails("quota", STATE, QUESTIONS)   # not reset on Cloudflare's side yet
+    assert len(clef_api.requests) == 2
+    assert clef.quota_exhausted_until() <= datetime(2026, 10, 9, 0, 5, tzinfo=timezone.utc)
+    _fails("quota", STATE, QUESTIONS)   # paused: no request
+    assert len(clef_api.requests) == 2
+
+    now[0] = datetime(2026, 10, 9, 0, 5, tzinfo=timezone.utc)
+    clef_api.reply(_answers(clef_api))
+    clef.decide(STATE, QUESTIONS)
+    assert len(clef_api.requests) == 3
+
+    # Still used up well after midnight: that is today's allowance gone.
+    now[0] = datetime(2026, 10, 9, 0, 30, tzinfo=timezone.utc)
+    clef_api.error(429, 3036)
+    _fails("quota", STATE, QUESTIONS)
+    assert clef.quota_exhausted_until() == datetime(2026, 10, 10, tzinfo=timezone.utc)
 
 
 def test_parallel_calls_that_hit_the_quota_log_it_once(clef_api, caplog):
@@ -528,6 +593,19 @@ def test_adecide_errors_map_like_decide(clef_api, fail, kind):
         asyncio.run(clef.adecide(STATE, QUESTIONS))
     assert err.value.kind == kind
     assert _rows() == []
+
+
+def test_adecide_gives_up_at_its_timeout_however_slowly_the_answer_comes(monkeypatch):
+    # httpx's timeout applies to each phase and each read; the call as a whole
+    # must still end at the timeout.
+    async def trickling(request):
+        await asyncio.sleep(2)
+        return httpx.Response(200, json={})
+    monkeypatch.setattr(clef, "_transport", httpx.MockTransport(trickling))
+    started = time.perf_counter()
+    with pytest.raises(clef.ClefError) as err:
+        asyncio.run(clef.adecide(STATE, QUESTIONS, timeout=0.2))
+    assert err.value.kind == "timeout" and time.perf_counter() - started < 1
 
 
 def test_adecide_refuses_locally_like_decide(clef_api, monkeypatch):

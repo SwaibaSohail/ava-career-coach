@@ -180,7 +180,9 @@ than a label. Why:
 `shadow` and `clef` need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (a
 Workers AI token: dashboard → AI → Workers AI → Use REST API). Without them the
 backend logs a warning once and runs as `groq`. The token is never logged and
-`/api/config` doesn't expose it.
+`/api/config` doesn't expose it. A token pasted with a stray space, quote or
+invisible character is refused before any request, and logged at ERROR like a
+rejected one.
 
 **How Clef decides.** One request asks four questions, versioned together as
 `guard-v1`: which of the four classes the message is (a choice), and a yes/no
@@ -201,30 +203,41 @@ characters, so the two windows cover everything. `0` turns windows off.
 **When Clef fails** (a timeout, a server error, a rejected token, the daily
 allowance used up): with `CLEF_FALLBACK=groq` (the default), the Groq guard runs on
 a tight budget instead: `CLEF_FALLBACK_TIMEOUT_S` (5 s) and no retries. If that
-fails too, the check is skipped and the message goes through. The chain is Clef
-(3 s, `CLEF_TIMEOUT_S`) → Groq (5 s) → skip, so the guard waits about 8 s at most.
-In Groq-only mode it waits up to 8 s per attempt over 2 attempts. With
+fails too, the check is skipped and the message goes through. Any other error in
+the Clef check falls back the same way. The chain is Clef (3 s for the whole
+check, `CLEF_TIMEOUT_S`) → Groq (5 s) → skip, so the guard waits about 8 s at
+most. In Groq-only mode it waits up to 8 s per attempt over 2 attempts, half a
+second apart; it never waits out a rate limit's `Retry-After`. Each limit is a
+deadline the guard keeps itself, however slowly an answer trickles in (httpx's
+own timeout applies to each read, not to the whole call). With
 `CLEF_FALLBACK=open`, a failed Clef check is skipped straight away (the regex and
 rule stages still apply).
 
 **Daily allowance.** Clef runs on Workers AI's free 10,000 Neurons a day, shared
 by everything on the Cloudflare account. Once they are used up, Clef isn't called
 again until they reset at **00:00 UTC (05:00 PKT)**. This is logged once at ERROR,
-and the fallback answers in the meantime. A rejected token is logged at ERROR at
+and the fallback answers in the meantime. In the first 10 minutes after 00:00 UTC,
+a used-up answer means Cloudflare hasn't reset yet (the clocks differ by seconds,
+or the call was sent before midnight), so Clef is tried again a minute later
+rather than paused for another day. A rejected token is logged at ERROR at
 most every 5 minutes. Clef calls go into the usage ledger as provider `cloudflare`,
 feature `guard` (`guard.shadow` in shadow mode), one row per window.
 
 **Decision log.** Every Clef guard check writes one row to `backend/data/guard.db`
 (`GUARD_LOG_DB`, gitignored): the time, mode, question-set version, rule,
 threshold, model, number of windows, Clef's seven probabilities, Clef's label,
-Groq's label (in shadow mode), latency and the error kind, if any. It never holds
-the message. The rule and threshold can be re-tuned from these rows.
+Groq's label (in shadow mode; empty when the Groq check failed), latency and the
+error kind, if any. It never holds the message. Rows are written by a background
+thread, so a slow or locked log never holds up a reply. The rule and threshold
+can be re-tuned from these rows.
 
 **Shadow text (dev only).** With `GUARD_SHADOW_STORE_TEXT=true`, shadow mode also
 keeps the text of messages where Clef and Groq disagreed, so they can be read and
-labelled. These rows are deleted after `GUARD_SHADOW_RETENTION_DAYS` (14). The flag
-is off by default and should stay off in production, where shadow mode then gives
-agreement rates, not examples.
+labelled. A message Groq failed to check is not a disagreement. These rows are
+deleted after `GUARD_SHADOW_RETENTION_DAYS` (14), whatever mode the guard runs in
+by then: the backend purges them at startup, every hour and before listing them,
+and overwrites them on disk. The flag is off by default and should stay off in
+production, where shadow mode then gives agreement rates, not examples.
 
 **Privacy.** Messages already go to Groq for the guard. Clef adds Cloudflare as a
 second processor of the same text; Cloudflare states that it does not store
@@ -239,7 +252,7 @@ server.
 | `CLEF_GUARD_RULE` | `choice` | or `noul` |
 | `CLEF_BLOCK_THRESHOLD` | `0.6` | the probability that blocks |
 | `CLEF_WINDOW_CHARS` | `6000` | `0` = one window |
-| `CLEF_TIMEOUT_S` | `3` | seconds per Clef call, no retries |
+| `CLEF_TIMEOUT_S` | `3` | seconds for the whole Clef check, no retries |
 | `CLEF_FALLBACK` | `groq` | or `open` |
 | `CLEF_FALLBACK_TIMEOUT_S` | `5` | the Groq fallback's budget, no retries |
 | `GUARD_LOG_DB` | `data/guard.db` | resolved against `backend/` |
@@ -256,7 +269,8 @@ real Groq and Cloudflare keys and is not part of `pytest`. From `backend/`:
 
 ```bash
 python -m evals.guard_eval cutoff                    # how much of a long message Clef reads
-python -m evals.guard_eval run --set dev --backends groq,clef,clef-flash --pipeline
+python -m evals.guard_eval cutoff --lang ur          # the same with an Urdu-script CV
+python -m evals.guard_eval run --set dev --backends groq,clef,clef-flash
 python -m evals.guard_eval score --set dev --sweep   # pick the rule and threshold
 python -m evals.guard_eval score --set holdout --rule choice --threshold 0.6
 python -m evals.guard_eval disagreements --export unlabelled.jsonl
@@ -267,37 +281,45 @@ python -m evals.guard_eval disagreements --export unlabelled.jsonl
 message: `{"id", "text", "label", "lang", "kind"}`, with `label` one of `clean`,
 `injection`, `abuse`, `harmful` and `lang` one of `en`, `ur`, `roman_ur`, `mixed`.
 A bad row stops the command and names its line. Tune on dev; report on holdout,
-which stays frozen.
+which stays frozen. No two rows of one label are versions of the same text, and
+the holdout shares no text with dev (both are checked by `pytest`).
 
 **cutoff** sends a clean 10,000-character CV with a blunt injection placed after
 500, 1,000, 2,000 and so on up to 9,500 characters, each text whole as one window
 (12 calls). It prints Clef's `p(injection)`, `is_injection` and input tokens at each
-offset, and the largest offset still caught. If the trigger is still caught after
-8,000 characters (Ava's cap), one window reads every message
+offset, and the offset up to which every one was caught; a miss before a later
+catch is flagged, and only the unbroken run counts. Run it with `--lang ur` too:
+Urdu script takes more tokens a character, so if Clef reads a set number of
+tokens it reads fewer Urdu characters. Only if both runs catch the trigger at
+every offset past 8,000 characters (Ava's cap) does one window read every message
 (`CLEF_WINDOW_CHARS=0`). Otherwise set `CLEF_WINDOW_CHARS` no higher than the
-largest offset caught; the first and last windows cover a whole 8,000-character
-message only while the window is at least 4,000 characters.
+smaller of the two offsets; the first and last windows cover a whole
+8,000-character message only while the window is at least 4,000 characters.
 
 **run** asks each backend about each row, one call at a time, and caches the
 answers in `backend/evals/out/` (gitignored), one file per set, backend and
 question-set version. A later run asks only what isn't cached yet: a new row, an
-edited row, or every row after `GUARD_MODEL` changes; `--fresh` asks again anyway
-and `--limit N` takes the first N rows. Clef's seven probabilities are kept for
-each window, so any rule and threshold can be scored later without new calls.
-`--pipeline` also records whether stages 1-4 would have blocked the message;
-stage 5 is still asked about every message. Before calling Clef, `run` prints the
-estimated Neurons against the free 10,000 a day and won't use more than 80% of
-them without `--yes`. If the allowance runs out it stops, and the answers so far
+edited row, every Groq row after `GUARD_MODEL`, `GUARD_REASONING_EFFORT` or the
+guard prompt changes, and the Clef rows a new `CLEF_WINDOW_CHARS` splits
+differently (or every Clef row after the model changes); `--fresh` asks again
+anyway and `--limit N` takes the first N rows. Clef's seven probabilities are kept
+for each window, so any rule and threshold can be scored later without new calls.
+Stage 5 is asked about every message, even one stages 1-4 would block. Before
+calling Clef, `run` prints the estimated Neurons against the free 10,000 a day and
+won't use more than 80% of them without `--yes`. If the allowance runs out it stops, and the answers so far
 stay cached. Don't run the eval on the same UTC day as a day of shadow traffic.
 Calls are billed in the usage ledger as feature `eval.guard`.
 
 **score** makes no calls. For each backend it prints the verdicts against the true
 labels; bad messages caught and missed, and good ones wrongly blocked, overall, by
 language and by kind; latency p50, p95 and max; errors by kind; mean input
-tokens; and USD per 1,000 messages. A Clef check that failed counts as letting the
-message through. `--rule` and `--threshold` (default: the configured ones)
-re-score Clef from the cache; `--sweep` prints caught/missed/wrongly blocked at
-thresholds 0.30 to 0.95 under both rules.
+tokens; and USD per 1,000 messages. It also gives the counts with stages 1-4 in
+front, worked out as it scores, so a regex or rule edit counts at once. A Clef
+check that failed counts as letting the message through. Only answers that fit
+the settings as they are now are scored; rows without one are counted and left
+out. `--rule` and `--threshold` (default: the configured ones) re-score Clef from
+the cache; `--sweep` prints caught/missed/wrongly blocked at thresholds 0.30 to
+0.95 under both rules.
 
 **Reading the acceptance block.** Each Clef backend is compared with Groq on the
 same rows. Each check prints `ok` or `FAIL` with both counts.
@@ -309,12 +331,17 @@ same rows. Each check prints `ok` or `FAIL` with both counts.
   blocks no more.
 - Switch `GUARD_BACKEND` to `clef` only when both hold on the holdout set; the last
   line then gives the settings to use. Otherwise keep `groq`, share the numbers,
-  and run shadow mode to collect real disagreements. These are counts on about 150
-  messages: a smoke test, not a benchmark.
+  and run shadow mode to collect real disagreements. While any row is left out
+  (a run cut short by `--limit` or the daily allowance), the block is marked
+  provisional and never recommends the switch: the holdout is sorted by label, so
+  the missing rows may be whole classes. These are counts on about 130 messages: a
+  smoke test, not a benchmark.
 
 **disagreements** lists what shadow mode stored (only with
 `GUARD_SHADOW_STORE_TEXT=true`). `--export` writes them as set rows with `label`
-and `lang` left empty, to be labelled before they join a set.
+and `lang` left empty, to be labelled before they join a set. A relative path goes
+in `backend/evals/out/` (gitignored), since the file holds real messages that the
+retention purge can't reach: delete it once they are labelled.
 
 ## API
 

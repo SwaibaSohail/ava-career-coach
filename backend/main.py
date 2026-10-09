@@ -7,6 +7,7 @@ GET /api/admin/usage is the internal billing report. CORS is enabled for the
 React dev server on port 5173.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 import config
+import guard_log
 import metering
 from actions import execute_email
 from config import is_smtp_configured
@@ -42,13 +44,28 @@ from session_store import create_session, find_document, find_pending_action, ge
 log = logging.getLogger(__name__)
 
 
+_PURGE_EVERY_S = 3600
+
+
+async def _purge_guard_log() -> None:
+    """Delete shadow-mode disagreement text once it is past its retention
+    period, whatever the guard runs on now: shadow checks purge as they go, but
+    they stop when shadow mode does."""
+    while True:
+        await run_in_threadpool(guard_log.purge_old)
+        await asyncio.sleep(_PURGE_EVERY_S)
+
+
 @asynccontextmanager
 async def _lifespan(app):
+    purger = asyncio.create_task(_purge_guard_log())
     # Load MCP tools once at startup (fail-safe: never blocks the app on error).
     await init_mcp()
     yield
-    # Write usage rows still queued, waiting off the event loop.
+    purger.cancel()
+    # Write usage and guard-log rows still queued, waiting off the event loop.
     await run_in_threadpool(metering.flush)
+    await run_in_threadpool(guard_log.flush)
 
 
 app = FastAPI(title="Ava — CV & Job Coach API", lifespan=_lifespan)

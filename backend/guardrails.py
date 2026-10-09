@@ -14,7 +14,7 @@ import threading
 import time
 import unicodedata
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import clef
@@ -204,6 +204,29 @@ def _parse_guard_label(text: str) -> str | None:
 
 _warned_no_clef = False
 
+# Every stage-5 call (a Groq attempt, a Clef window) runs on this pool, so the
+# guard can stop waiting at its own deadline: httpx applies its timeout to each
+# phase of a request (connect, each read), not to the whole call. Sized for
+# anyio's 40 request threads with two Clef windows each, so a check waits on
+# Groq or Clef, never on a free thread.
+_pool = ThreadPoolExecutor(max_workers=80, thread_name_prefix="guard-call")
+
+
+def _submit(fn, *args):
+    """fn(*args) on the pool, in a copy of this context, so its ledger row lands
+    on the caller's client, session and feature."""
+    return _pool.submit(contextvars.copy_context().run, fn, *args)
+
+
+def _wait_at_most(seconds: float, future):
+    """The future's result, or TimeoutError after seconds. The call is dropped:
+    cancelled if it hasn't started, left to finish on its own if it has."""
+    try:
+        return future.result(timeout=seconds)
+    except TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"no answer within {seconds:g} s") from None
+
 
 def check_input_llm(message: str) -> str:
     """Cheap LLM safety classifier. Returns a label; fails OPEN to 'CLEAN'.
@@ -224,44 +247,66 @@ def check_input_llm(message: str) -> str:
     with metering.feature("guard"):   # whoever answers: Clef, Groq or Clef's fallback
         if backend == "clef":
             return _clef_decides(message)
-        label = _groq_guard(message)
-    if backend == "shadow":
-        _submit_shadow(message, label)   # never waited on
-    return label
+        if backend != "shadow":
+            return _groq_guard(message)
+        groq_label = _groq_label(message)   # None if Groq failed: no verdict for the log
+    _submit_shadow(message, groq_label)   # never waited on
+    return groq_label or "CLEAN"
 
 
-def _groq_guard(message: str, *, timeout: float | None = None,
-                max_retries: int | None = None) -> str:
-    """The Groq classifier on the guard's own budget (None = GUARD_TIMEOUT_S /
-    GUARD_MAX_RETRIES), billed to the caller's metering feature. Returns a
-    label; fails OPEN to 'CLEAN'."""
+_RETRY_PAUSE_S = 0.5   # before the guard's own retry, whatever wait a rate limit asks for
+
+
+def _worth_retrying(exc: Exception) -> bool:
+    """What a second try may get past: a timeout, a dropped connection, a rate
+    limit or a server error (what the groq SDK itself would retry)."""
+    import groq
+    if isinstance(exc, (TimeoutError, groq.APIConnectionError)):
+        return True
+    return isinstance(exc, groq.APIStatusError) and (exc.status_code in (408, 409, 429) or exc.status_code >= 500)
+
+
+def _groq_guard(message: str, **budget) -> str:
+    """_groq_label, failing OPEN to 'CLEAN'."""
+    return _groq_label(message, **budget) or "CLEAN"
+
+
+def _groq_label(message: str, *, timeout: float | None = None, max_retries: int | None = None) -> str | None:
+    """The Groq classifier's label on the guard's own budget (None =
+    GUARD_TIMEOUT_S per attempt, GUARD_MAX_RETRIES), billed to the caller's
+    metering feature; None when it failed or replied without one (logged)."""
+    timeout = config.GUARD_TIMEOUT_S if timeout is None else timeout
+    retries = config.GUARD_MAX_RETRIES if max_retries is None else max_retries
     try:
         from llm import get_llm
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = get_llm(
-            temperature=0, model=config.GUARD_MODEL,
-            reasoning_effort=config.GUARD_REASONING_EFFORT,
-            timeout=config.GUARD_TIMEOUT_S if timeout is None else timeout,
-            max_retries=config.GUARD_MAX_RETRIES if max_retries is None else max_retries,
-        )
-        resp = llm.invoke(
-            [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
-        )
+        # No retries in the SDK: it would wait as long as a rate limit's
+        # Retry-After asks (up to 60 s). The guard retries by itself.
+        llm = get_llm(temperature=0, model=config.GUARD_MODEL, reasoning_effort=config.GUARD_REASONING_EFFORT,
+                      timeout=timeout, max_retries=0)
+        messages = [SystemMessage(content=_GUARD_SYSTEM), HumanMessage(content=message)]
+        for attempt in range(retries + 1):
+            try:
+                resp = _wait_at_most(timeout, _submit(llm.invoke, messages))
+                break
+            except Exception as exc:
+                if attempt == retries or not _worth_retrying(exc):
+                    raise
+                time.sleep(_RETRY_PAUSE_S)
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         label = _parse_guard_label(content)
         if label is None:
             # The reply may echo the message, so log only its length.
             log.warning("guard model %s replied without a label (%d chars); "
                         "skipping the LLM check", config.GUARD_MODEL, len(content))
-            return "CLEAN"
         return label
     except Exception as exc:
         # Fail open: never block real users on an outage. Log the model and the
         # error (never the message) so a retired model or outage is visible.
         log.warning("guard model %s failed (%s: %s); skipping the LLM check",
                     config.GUARD_MODEL, type(exc).__name__, exc)
-        return "CLEAN"
+        return None
 
 
 # --- Stage 5 on Clef: calibrated probabilities -------------------------------
@@ -321,24 +366,26 @@ def label_from_probabilities(probs: dict, rule: str, threshold: float) -> str:
     return worst.upper() if probs[prefix + worst] >= threshold else "CLEAN"
 
 
-_window_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="clef-window")
-
-
 def _ask_clef(window: str, model: str) -> clef.Decision:
     return clef.decide({"message": window}, GUARD_QUESTIONS, model=model)
 
 
 def clef_guard(message: str, *, model: str | None = None) -> tuple[str, dict, list]:
     """Clef's verdict on a message: (label, its seven probabilities, the
-    per-window decisions). Blocking: windows are asked in parallel and each
-    call is billed to the caller's metering feature. Raises clef.ClefError if
-    any window fails."""
+    per-window decisions). Blocking: windows are asked in parallel, with
+    CLEF_TIMEOUT_S for the whole check, and each call is billed to the caller's
+    metering feature. Raises clef.ClefError if any window fails or time runs out."""
     model = model or config.CLEF_GUARD_MODEL
-    first, *rest = guard_windows(message, config.CLEF_WINDOW_CHARS)
-    # Each other window runs on the pool in a copy of this context, so its
-    # ledger row lands on the caller's client, session and feature.
-    others = [_window_pool.submit(contextvars.copy_context().run, _ask_clef, w, model) for w in rest]
-    decisions = [_ask_clef(first, model)] + [f.result() for f in others]
+    futures = [_submit(_ask_clef, w, model) for w in guard_windows(message, config.CLEF_WINDOW_CHARS)]
+    done, pending = wait(futures, timeout=config.CLEF_TIMEOUT_S, return_when=FIRST_EXCEPTION)
+    for future in pending:
+        future.cancel()   # a window still queued is never sent; one under way finishes unread
+    failed = [f.exception() for f in futures if f in done and f.exception() is not None]
+    if failed:
+        raise failed[0]
+    if pending:
+        raise clef.ClefError("timeout", f"no answer within {config.CLEF_TIMEOUT_S:g} s")
+    decisions = [f.result() for f in futures]
     probs = combine_windows(decisions)
     return label_from_probabilities(probs, config.CLEF_GUARD_RULE, config.CLEF_BLOCK_THRESHOLD), probs, decisions
 
@@ -374,11 +421,14 @@ def _clef_failed(error: clef.ClefError, then: str) -> None:
 
 
 def _clef_decides(message: str) -> str:
-    """clef mode: Clef's label, or on a ClefError the fallback's (CLEF_FALLBACK)."""
+    """clef mode: Clef's label, or when the check fails the fallback's (CLEF_FALLBACK)."""
     started = time.perf_counter()
     try:
         label, probs, _ = clef_guard(message)
-    except clef.ClefError as error:
+    except Exception as exc:
+        # Anything else that breaks the check (a bug, a pool shutting down) falls
+        # back the same way. Only its type is kept: its text might quote the message.
+        error = exc if isinstance(exc, clef.ClefError) else clef.ClefError("unexpected", type(exc).__name__)
         _log_decision("clef", message, started, error=error.kind)
         if config.CLEF_FALLBACK == "open":
             _clef_failed(error, "skipping the LLM check")
@@ -397,7 +447,7 @@ _shadow_idle = threading.Condition()
 _shadow_pending = 0   # submitted, not yet finished
 
 
-def _submit_shadow(message: str, groq_label: str) -> None:
+def _submit_shadow(message: str, groq_label: str | None) -> None:
     """Queue a Clef check of a message Groq has judged, and return at once.
     Skipped while 20 are pending (Clef slow or down)."""
     global _shadow_pending
@@ -410,16 +460,18 @@ def _submit_shadow(message: str, groq_label: str) -> None:
     _shadow_pool.submit(contextvars.copy_context().run, _shadow_call, message, groq_label)
 
 
-def _shadow_call(message: str, groq_label: str) -> None:
-    """Ask Clef about a message Groq has judged; log both labels, and the text
-    when they differ and GUARD_SHADOW_STORE_TEXT is on. Never raises."""
+def _shadow_call(message: str, groq_label: str | None) -> None:
+    """Ask Clef about a message Groq has judged (groq_label None: Groq failed);
+    log both labels, and the text when they differ and GUARD_SHADOW_STORE_TEXT
+    is on. Never raises."""
     global _shadow_pending
     started = time.perf_counter()
     try:
         with metering.feature("guard.shadow"):
             label, probs, _ = clef_guard(message)
         _log_decision("shadow", message, started, probabilities=probs, clef_label=label, groq_label=groq_label)
-        if label != groq_label and config.GUARD_SHADOW_STORE_TEXT:
+        # A Groq that failed gave no verdict to disagree with.
+        if groq_label is not None and label != groq_label and config.GUARD_SHADOW_STORE_TEXT:
             guard_log.record_disagreement(qset_version=GUARD_QSET_VERSION, model=config.CLEF_GUARD_MODEL,
                                           groq_label=groq_label, clef_label=label, probabilities=probs,
                                           message=message)
