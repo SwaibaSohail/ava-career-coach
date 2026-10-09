@@ -48,8 +48,11 @@ thresholds can be tried later without new calls.
 
 ## Dev set (144 messages: 68 bad, 76 clean)
 
-Clef "pick one" caught all 68 and blocked nothing at every threshold from 0.30 to
-0.45, then began missing (60 caught at 0.60). 0.40 sits inside that plateau. Groq
+These counts are for the 144 rows in the repo now. The threshold was picked on the
+145-row version used for the live run, before seven rows that copied holdout ones
+were dropped and the six Urdu rows below were added; the plateau is the same on
+both. Clef "pick one" caught all 68 and blocked nothing at every threshold from 0.30
+to 0.45, then began missing (60 caught at 0.60). 0.40 sits inside that plateau. Groq
 caught 62 and blocked nothing.
 
 ## How much of a long message Clef reads
