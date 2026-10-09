@@ -857,6 +857,50 @@ def test_long_messages_checked_at_once_never_queue_behind_each_other(clef_api, m
     assert len(clef_api.requests) == 24 and max(took) < 0.8
 
 
+def _groq_answers_on_the_pool(monkeypatch, label):
+    """The real _groq_label (each attempt on the guard's pool, given up at its
+    deadline) with a Groq that answers label at once."""
+    import llm
+    from types import SimpleNamespace
+    monkeypatch.setattr(app_config, "GROQ_API_KEY", "test-key")
+
+    class Quick:
+        def invoke(self, messages):
+            return SimpleNamespace(content=label)
+    monkeypatch.setattr(llm, "get_llm", lambda **kw: Quick())
+
+
+def test_a_stalled_clef_under_load_never_costs_a_message_its_groq_fallback(clef_api, monkeypatch):
+    # 40 request threads, three messages each, while Cloudflare stalls: every
+    # Clef call outlives its check (3 s), as one stalled in several httpx
+    # phases does. Timeouts are the defaults scaled together by 1/15.
+    _on(monkeypatch, "clef")
+    monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 3 / 15)
+    monkeypatch.setattr(app_config, "CLEF_FALLBACK_TIMEOUT_S", 5 / 15)
+    _groq_answers_on_the_pool(monkeypatch, "ABUSE")   # so a reply shows Groq was asked
+    released, stalled = threading.Event(), []
+    def stall(body):
+        stalled.append(1)
+        released.wait(10)
+        raise httpx.ReadTimeout("timed out")   # given up on at last: no ledger row
+    clef_api.reply(stall)
+
+    def three_messages(_):
+        took = []
+        for _ in range(3):
+            started = time.perf_counter()
+            took.append((check_input_llm("How do I improve my CV?"), time.perf_counter() - started))
+        return took
+    try:
+        with ThreadPoolExecutor(40) as users:
+            checks = [c for user in users.map(three_messages, range(40)) for c in user]
+    finally:
+        released.set()
+    assert [label for label, _ in checks] == ["ABUSE"] * 120
+    assert max(took for _, took in checks) < (3 + 5) / 15 + 0.5
+    assert len(stalled) < 120   # windows queued behind stalled ones were never sent
+
+
 def test_a_check_that_gives_up_never_sends_its_queued_windows(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 0.3)
