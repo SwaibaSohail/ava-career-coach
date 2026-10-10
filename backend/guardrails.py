@@ -459,7 +459,14 @@ def _submit_shadow(message: str, groq_label: str | None) -> None:
     global _shadow_pending
     with _shadow_idle:
         if _shadow_pending >= _SHADOW_MAX_PENDING:
-            log.debug("guard: %d shadow checks pending; skipping this one", _shadow_pending)
+            # How shadow mode goes quiet (Clef stuck, or slots lost): say so now and then.
+            now = time.monotonic()
+            if now - _last_error_at.get("shadow-full", now - _ERROR_EVERY_S) >= _ERROR_EVERY_S:
+                _last_error_at["shadow-full"] = now
+                log.warning("guard: %d shadow checks pending; skipping new ones until they finish",
+                            _shadow_pending)
+            else:
+                log.debug("guard: %d shadow checks pending; skipping this one", _shadow_pending)
             return
         _shadow_pending += 1
     # Once the pool is shut down (interpreter exit), submit raises and the slot

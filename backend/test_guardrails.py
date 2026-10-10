@@ -1333,6 +1333,23 @@ def test_shadow_mode_keeps_checking_with_a_retention_of_for_ever(clef_api, monke
     assert len(clef_api.requests) == 25
 
 
+def test_skipped_shadow_checks_are_a_warning_every_few_minutes(caplog):
+    # A full queue is how shadow mode goes quiet (Clef stuck, or slots lost):
+    # visible without debug logging, but not once per message.
+    before, guardrails._shadow_pending = guardrails._shadow_pending, guardrails._SHADOW_MAX_PENDING
+    try:
+        with caplog.at_level(logging.DEBUG, logger="guardrails"):
+            for _ in range(3):
+                guardrails._submit_shadow(SENTINEL, "CLEAN")
+            guardrails._last_error_at["shadow-full"] -= guardrails._ERROR_EVERY_S   # a few minutes later
+            guardrails._submit_shadow(SENTINEL, "CLEAN")
+    finally:
+        guardrails._shadow_pending = before
+    warnings = [r.getMessage() for r in caplog.records if r.name == "guardrails" and r.levelno >= logging.WARNING]
+    assert len(warnings) == 2 and all("20 shadow checks pending" in w for w in warnings)
+    assert "SENTINEL" not in caplog.text
+
+
 def test_a_shadow_check_queued_while_no_thread_can_start_still_gives_its_slot_back(monkeypatch):
     # submit queues the job before it starts a thread. Were there no thread at
     # all, 20 such jobs would hold every slot for good, so the pool starts its
@@ -1430,7 +1447,7 @@ def test_shadow_checks_are_skipped_while_20_are_pending(clef_api, monkeypatch, c
     assert guardrails._shadow_drain(10)
     assert len(clef_api.requests) == 20 and len(_decisions()) == 20
     skipped = [r for r in caplog.records if r.name == "guardrails" and "skipping" in r.getMessage()]
-    assert len(skipped) == 2 and all(r.levelno == logging.DEBUG for r in skipped)
+    assert [r.levelno for r in skipped] == [logging.WARNING, logging.DEBUG]   # warned once, then quiet
 
 
 def test_a_failed_shadow_check_is_logged_without_the_message(clef_api, monkeypatch, caplog):
