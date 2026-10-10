@@ -912,6 +912,8 @@ def _clef_pool_full():
     """Every thread of the real Clef pool taken for the block; freed and waited
     for on the way out, so no later test meets a busy pool."""
     free = threading.Event()
+    # _max_workers is private to ThreadPoolExecutor: should a Python upgrade move
+    # it, this test breaks, not the guard, which never reads it.
     blockers = [guardrails._clef_pool.submit(free.wait, 10) for _ in range(guardrails._clef_pool._max_workers)]
     try:
         yield
@@ -1339,14 +1341,18 @@ def test_skipped_shadow_checks_are_a_warning_every_few_minutes(caplog):
     before, guardrails._shadow_pending = guardrails._shadow_pending, guardrails._SHADOW_MAX_PENDING
     try:
         with caplog.at_level(logging.DEBUG, logger="guardrails"):
+            # A credential error just before has its own rate limit: it must not
+            # hold back the first skip warning.
+            guardrails._clef_failed(clef.ClefError("auth", "HTTP 401"), "using the Groq guard instead")
             for _ in range(3):
                 guardrails._submit_shadow(SENTINEL, "CLEAN")
-            guardrails._last_error_at["shadow-full"] -= guardrails._ERROR_EVERY_S   # a few minutes later
+            for key in guardrails._last_error_at:   # a few minutes later
+                guardrails._last_error_at[key] -= guardrails._ERROR_EVERY_S
             guardrails._submit_shadow(SENTINEL, "CLEAN")
     finally:
         guardrails._shadow_pending = before
-    warnings = [r.getMessage() for r in caplog.records if r.name == "guardrails" and r.levelno >= logging.WARNING]
-    assert len(warnings) == 2 and all("20 shadow checks pending" in w for w in warnings)
+    warnings = [r.getMessage() for r in caplog.records if r.name == "guardrails" and r.levelno == logging.WARNING]
+    assert warnings == ["guard: 20 shadow checks pending; skipping new ones until they finish"] * 2
     assert "SENTINEL" not in caplog.text
 
 
@@ -1361,6 +1367,8 @@ def test_a_shadow_check_queued_while_no_thread_can_start_still_gives_its_slot_ba
         raise RuntimeError("can't start new thread")
     def clef_down(message, **kwargs):
         raise clef.ClefError("server", "HTTP 503")
+    # _adjust_thread_count is private to ThreadPoolExecutor: should a Python
+    # upgrade move it, this test breaks, not the guard, which never calls it.
     monkeypatch.setattr(fresh._shadow_pool, "_adjust_thread_count", no_thread)
     monkeypatch.setattr(fresh, "clef_guard", clef_down)
     try:
