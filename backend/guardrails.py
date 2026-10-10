@@ -448,6 +448,7 @@ def _clef_decides(message: str) -> str:
 
 _SHADOW_MAX_PENDING = 20
 _shadow_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="clef-shadow")
+_shadow_pool.submit(lambda: None)   # starts its first thread now; see _submit_shadow
 _shadow_idle = threading.Condition()
 _shadow_pending = 0   # submitted, not yet finished
 
@@ -463,9 +464,9 @@ def _submit_shadow(message: str, groq_label: str | None) -> None:
         _shadow_pending += 1
     # Once the pool is shut down (interpreter exit), submit raises and the slot
     # taken above is never given back. Left as is on purpose: no request is
-    # guarded after that point. (submit can also raise while the pool is still
-    # starting its two threads, if no thread can be started; the job is queued
-    # by then, so its slot still comes back.)
+    # guarded after that point. (submit can also raise when a second thread
+    # can't be started; the job is queued by then and the thread started on
+    # import runs it, so its slot still comes back.)
     # In a copy of this context, so Clef's ledger row lands on the user's client and chat.
     _shadow_pool.submit(contextvars.copy_context().run, _shadow_call, message, groq_label)
 

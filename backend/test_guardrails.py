@@ -1309,6 +1309,17 @@ def test_a_retention_too_long_for_the_calendar_keeps_everything(monkeypatch, day
     assert _stored_messages() == ["today"]
 
 
+@pytest.mark.parametrize("days", [500000, 730000, 739000])   # cutoffs in the years 657, 28 and 3
+def test_a_cutoff_before_the_year_1000_still_keeps_everything_newer(monkeypatch, days):
+    # The log compares timestamps as text, so a year must be four digits.
+    _at(monkeypatch, datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc))
+    _disagreement("today")
+    monkeypatch.setattr(app_config, "GUARD_SHADOW_RETENTION_DAYS", days)
+    assert guard_log.purge_old() == 0
+    assert _stored_messages() == ["today"]
+    assert guard_log._iso(datetime(28, 1, 2, tzinfo=timezone.utc)) == "0028-01-02T00:00:00.000000Z"
+
+
 def test_shadow_mode_keeps_checking_with_a_retention_of_for_ever(clef_api, monkeypatch):
     # Each shadow check purges as it ends; a purge that raised used to skip
     # giving its slot back, so shadow mode stopped for good after 20 checks.
@@ -1320,6 +1331,31 @@ def test_shadow_mode_keeps_checking_with_a_retention_of_for_ever(clef_api, monke
         check_input_llm("How do I improve my CV?")
         assert guardrails._shadow_drain(1)
     assert len(clef_api.requests) == 25
+
+
+def test_a_shadow_check_queued_while_no_thread_can_start_still_gives_its_slot_back(monkeypatch):
+    # submit queues the job before it starts a thread. Were there no thread at
+    # all, 20 such jobs would hold every slot for good, so the pool starts its
+    # first thread on import. A fresh copy of the module shows it as imported.
+    spec = importlib.util.spec_from_file_location("guardrails_fresh", guardrails.__file__)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    def no_thread():
+        raise RuntimeError("can't start new thread")
+    def clef_down(message, **kwargs):
+        raise clef.ClefError("server", "HTTP 503")
+    monkeypatch.setattr(fresh._shadow_pool, "_adjust_thread_count", no_thread)
+    monkeypatch.setattr(fresh, "clef_guard", clef_down)
+    try:
+        for _ in range(25):
+            try:
+                fresh._submit_shadow("How do I improve my CV?", "CLEAN")
+            except RuntimeError:
+                pass   # the job is queued all the same
+        assert fresh._shadow_drain(1) and fresh._shadow_pending == 0
+    finally:
+        for pool in (fresh._shadow_pool, fresh._clef_pool, fresh._groq_pool):
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def test_each_shadow_check_purges_old_disagreements(clef_api, monkeypatch):

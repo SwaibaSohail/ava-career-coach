@@ -84,7 +84,9 @@ def _utcnow() -> datetime:
 
 
 def _iso(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # The year padded by hand: %Y may not pad years before 1000, and the log
+    # compares these as text.
+    return f"{dt.year:04d}" + dt.strftime("-%m-%dT%H:%M:%S.%fZ")
 
 
 def _db_path() -> str:
