@@ -11,7 +11,8 @@ import logging
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from glob import glob
 
@@ -878,11 +879,14 @@ def test_a_stalled_clef_under_load_never_costs_a_message_its_groq_fallback(clef_
     monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 3 / 15)
     monkeypatch.setattr(app_config, "CLEF_FALLBACK_TIMEOUT_S", 5 / 15)
     _groq_answers_on_the_pool(monkeypatch, "ABUSE")   # so a reply shows Groq was asked
-    released, stalled = threading.Event(), []
+    released, stalled, ended = threading.Event(), [], []
     def stall(body):
         stalled.append(1)
-        released.wait(10)
-        raise httpx.ReadTimeout("timed out")   # given up on at last: no ledger row
+        try:
+            released.wait(10)
+            raise httpx.ReadTimeout("timed out")   # given up on at last: no ledger row
+        finally:
+            ended.append(1)
     clef_api.reply(stall)
 
     def three_messages(_):
@@ -896,21 +900,38 @@ def test_a_stalled_clef_under_load_never_costs_a_message_its_groq_fallback(clef_
             checks = [c for user in users.map(three_messages, range(40)) for c in user]
     finally:
         released.set()
+        deadline = time.monotonic() + 5   # the stalled calls end, so no later test meets a busy pool
+        while len(ended) < len(stalled) and time.monotonic() < deadline:
+            time.sleep(0.01)
     assert [label for label, _ in checks] == ["ABUSE"] * 120
     assert max(took for _, took in checks) < (3 + 5) / 15 + 0.5
-    assert len(stalled) < 120   # windows queued behind stalled ones were never sent
+
+
+@contextmanager
+def _clef_pool_full():
+    """Every thread of the real Clef pool taken for the block; freed and waited
+    for on the way out, so no later test meets a busy pool."""
+    free = threading.Event()
+    blockers = [guardrails._clef_pool.submit(free.wait, 10) for _ in range(guardrails._clef_pool._max_workers)]
+    try:
+        yield
+    finally:
+        free.set()
+        wait(blockers, timeout=5)
 
 
 @pytest.mark.parametrize("backend", ["clef", "shadow"])
 def test_a_full_clef_pool_never_holds_up_groq(clef_api, monkeypatch, backend):
     _on(monkeypatch, backend)
     monkeypatch.setattr(app_config, "CLEF_TIMEOUT_S", 0.2)
+    # Groq's budgets end long before the pool is freed, so a Groq call queued
+    # behind the full pool (one pool shared again) is given up on and fails this.
+    monkeypatch.setattr(app_config, "CLEF_FALLBACK_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(app_config, "GUARD_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(app_config, "GUARD_MAX_RETRIES", 0)
     _groq_answers_on_the_pool(monkeypatch, "ABUSE")
     clef_api.reply(_clef_answers(clef_api))
-    free = threading.Event()
-    for _ in range(guardrails._clef_pool._max_workers):
-        guardrails._clef_pool.submit(free.wait, 5)   # every Clef thread is taken
-    try:
+    with _clef_pool_full():
         started = time.perf_counter()
         assert check_input_llm("How do I improve my CV?") == "ABUSE"
         if backend == "shadow":   # Groq decides without waiting on Clef at all
@@ -920,9 +941,8 @@ def test_a_full_clef_pool_never_holds_up_groq(clef_api, monkeypatch, backend):
         # meets the full pool. It gives up within CLEF_TIMEOUT_S all the same.
         started = time.perf_counter()
         assert guardrails._shadow_drain(5) and time.perf_counter() - started < 1
-    finally:
-        free.set()
-    assert clef_api.requests == []   # Clef was queued, given up on and never sent
+    # Clef was given up on, in either mode. That a window given up on in the
+    # queue is never sent is test_a_check_that_gives_up_never_sends_its_queued_windows.
     assert [d["error"] for d in _decisions()] == ["timeout"]
 
 
@@ -1022,9 +1042,14 @@ def test_a_failed_window_fails_the_whole_clef_check(clef_api, monkeypatch):
     _on(monkeypatch, "clef")
     monkeypatch.setattr(app_config, "CLEF_WINDOW_CHARS", 6000)
     calls = _groq_calls(monkeypatch, "CLEAN")
+    head_sent = threading.Event()
     def answers(body):
         if TRIGGER in body["state"]["message"]:
+            # Fail only once the head is under way: the check returns at the
+            # first failure, so a tail failing first could leave the head unsent.
+            head_sent.wait(5)
             raise httpx.ReadTimeout("timed out")
+        head_sent.set()
         return _clef_answers(clef_api)
     clef_api.reply(answers)
     assert check_input_llm(_long_message()) == "CLEAN"

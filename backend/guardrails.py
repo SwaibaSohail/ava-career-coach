@@ -461,9 +461,11 @@ def _submit_shadow(message: str, groq_label: str | None) -> None:
             log.debug("guard: %d shadow checks pending; skipping this one", _shadow_pending)
             return
         _shadow_pending += 1
-    # submit raises only once the pool is shut down, i.e. at interpreter exit;
-    # the slot taken above is then never given back. Left as is on purpose: no
-    # request is guarded after that point.
+    # Once the pool is shut down (interpreter exit), submit raises and the slot
+    # taken above is never given back. Left as is on purpose: no request is
+    # guarded after that point. (submit can also raise while the pool is still
+    # starting its two threads, if no thread can be started; the job is queued
+    # by then, so its slot still comes back.)
     # In a copy of this context, so Clef's ledger row lands on the user's client and chat.
     _shadow_pool.submit(contextvars.copy_context().run, _shadow_call, message, groq_label)
 
