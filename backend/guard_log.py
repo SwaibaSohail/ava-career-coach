@@ -199,7 +199,10 @@ def purge_old() -> int:
     path = _db_path()
     if not os.path.exists(path):
         return 0   # nothing was ever logged
-    cutoff = _iso(_utcnow() - timedelta(days=config.GUARD_SHADOW_RETENTION_DAYS))
+    try:
+        cutoff = _iso(_utcnow() - timedelta(days=config.GUARD_SHADOW_RETENTION_DAYS))
+    except OverflowError:
+        return 0   # a retention reaching back past year 1 ("for ever"): nothing is old enough
     try:
         with closing(_connect(path)) as conn:
             with conn:

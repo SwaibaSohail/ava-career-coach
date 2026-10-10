@@ -1301,6 +1301,27 @@ def test_disagreements_are_purged_after_the_retention_period(monkeypatch):
     assert guard_log.purge_old() == 1 and guard_log.recent_disagreements(10) == []
 
 
+@pytest.mark.parametrize("days", [999999, 10**9])   # "for ever": past year 1, past timedelta's range
+def test_a_retention_too_long_for_the_calendar_keeps_everything(monkeypatch, days):
+    _disagreement("today")
+    monkeypatch.setattr(app_config, "GUARD_SHADOW_RETENTION_DAYS", days)
+    assert guard_log.purge_old() == 0
+    assert _stored_messages() == ["today"]
+
+
+def test_shadow_mode_keeps_checking_with_a_retention_of_for_ever(clef_api, monkeypatch):
+    # Each shadow check purges as it ends; a purge that raised used to skip
+    # giving its slot back, so shadow mode stopped for good after 20 checks.
+    monkeypatch.setattr(app_config, "GUARD_SHADOW_RETENTION_DAYS", 999999)
+    _on(monkeypatch, "shadow")
+    _groq_calls(monkeypatch)
+    clef_api.reply(_clef_answers(clef_api))
+    for _ in range(25):
+        check_input_llm("How do I improve my CV?")
+        assert guardrails._shadow_drain(1)
+    assert len(clef_api.requests) == 25
+
+
 def test_each_shadow_check_purges_old_disagreements(clef_api, monkeypatch):
     _at(monkeypatch, datetime.now(timezone.utc) - timedelta(days=15))
     _disagreement("15 days old")
