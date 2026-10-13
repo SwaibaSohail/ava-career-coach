@@ -93,6 +93,12 @@ tokens and estimated cost; never message text), and each client's monthly token
 allowance from `backend/plans.json` is checked before every message. Manage clients
 with `python manage_clients.py`; set `ADMIN_API_KEY` to enable `/api/admin/usage`.
 
+### Safety check (Groq and Clef)
+
+Every message is screened for prompt injection, abuse and harmful requests before
+Ava replies. With `GUARD_BACKEND=shadow` the check runs on both Groq and Cloudflare's
+Clef: Groq decides, and Clef checks each message alongside so the two can be compared.
+
 ## API
 
 | Method | Route | Purpose |
